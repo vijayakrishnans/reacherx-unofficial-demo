@@ -1,0 +1,801 @@
+import { v } from "convex/values";
+import { internalMutation, internalQuery, query } from "./lib/functionBuilders";
+import { internal } from "./_generated/api";
+import {
+  buildChangedPatch,
+  buildChangedPatchWithUpdatedAt,
+} from "./lib/patchHelpers";
+import {
+  mergeConversationAttachments,
+  mergeConversationQuotedMessage,
+  mergeConversationSharedPost,
+} from "./lib/xDm";
+import {
+  platformConversationAttachmentValidator,
+  conversationHistoryBoundaryValidator,
+  platformConversationDirectionValidator,
+  platformConversationEventMetadataValidator,
+  platformConversationEventTypeValidator,
+  platformConversationMessageTypeValidator,
+  platformConversationMessageLookupValidator,
+  platformConversationPlatformValidator,
+  platformConversationQuotedMessageValidator,
+  platformConversationReactionValidator,
+  platformConversationRevisionValidator,
+  platformConversationSharedPostValidator,
+  platformConversationSeenByValidator,
+  xActivityEventTypeValidator,
+  xDmEligibilityReasonCodeValidator,
+  xDmPanelWarningCodeValidator,
+} from "./validators";
+import { getCurrentUTCTimestamp } from "../shared/lib/utils/time/timeUtils";
+import { normalizeConversationHistoryPageLimit } from "./lib/conversationHistoryPaginationCore";
+import { requireUser } from "./lib/accessHelpers";
+
+const DEFAULT_CONVERSATION_SNAPSHOT_MESSAGE_LIMIT = 25;
+const READ_RECEIPT_UPDATE_BATCH_SIZE = 50;
+
+function sortMessagesByTime<T extends { createdAtMs: number }>(
+  messages: T[]
+): T[] {
+  return [...messages].sort(
+    (left, right) => left.createdAtMs - right.createdAtMs
+  );
+}
+
+function pickOptionalPatchValue<T extends object, K extends keyof T>(
+  args: T,
+  key: K,
+  fallback: T[K]
+): T[K] {
+  return Object.prototype.hasOwnProperty.call(args, key) ? args[key] : fallback;
+}
+
+/**
+ * Reactive revision for the current user's cached X conversation. The full
+ * provider-backed panel remains an action, while this small indexed query lets
+ * an open panel observe webhook writes without exposing another user's data.
+ */
+export const getTwitterConversationRevision = query({
+  args: {
+    prospectId: v.id("prospects"),
+  },
+  returns: platformConversationRevisionValidator,
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx);
+    const conversation = await ctx.db
+      .query("platformConversations")
+      .withIndex("by_user_prospect_platform", (q) =>
+        q
+          .eq("userId", user._id)
+          .eq("prospectId", args.prospectId)
+          .eq("platform", "twitter")
+      )
+      .first();
+
+    if (!conversation) {
+      return null;
+    }
+
+    return {
+      updatedAt: conversation.contentUpdatedAt ?? conversation.updatedAt,
+      latestMessageId: conversation.latestMessageId,
+      latestMessageAt: conversation.latestMessageAt,
+    };
+  },
+});
+
+/** Reactive revision for an open LinkedIn panel, updated by webhook writes. */
+export const getLinkedInConversationRevision = query({
+  args: {
+    prospectId: v.id("prospects"),
+  },
+  returns: platformConversationRevisionValidator,
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx);
+    const conversation = await ctx.db
+      .query("platformConversations")
+      .withIndex("by_user_prospect_platform", (q) =>
+        q
+          .eq("userId", user._id)
+          .eq("prospectId", args.prospectId)
+          .eq("platform", "linkedin")
+      )
+      .first();
+
+    if (!conversation) {
+      return null;
+    }
+
+    return {
+      updatedAt: conversation.contentUpdatedAt ?? conversation.updatedAt,
+      latestMessageId: conversation.latestMessageId,
+      latestMessageAt: conversation.latestMessageAt,
+    };
+  },
+});
+
+export const getConversationSnapshotInternal = internalQuery({
+  args: {
+    userId: v.id("users"),
+    platform: platformConversationPlatformValidator,
+    conversationId: v.optional(v.string()),
+    prospectId: v.optional(v.id("prospects")),
+    messageLimit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const conversation = args.conversationId
+      ? await ctx.db
+          .query("platformConversations")
+          .withIndex("by_user_conversation", (q) =>
+            q
+              .eq("userId", args.userId)
+              .eq("conversationId", args.conversationId!)
+          )
+          .first()
+      : await ctx.db
+          .query("platformConversations")
+          .withIndex("by_user_prospect_platform", (q) =>
+            q
+              .eq("userId", args.userId)
+              .eq("prospectId", args.prospectId!)
+              .eq("platform", args.platform)
+          )
+          .first();
+
+    if (!conversation) {
+      return null;
+    }
+
+    const messageLimit = normalizeConversationHistoryPageLimit(
+      args.messageLimit ?? DEFAULT_CONVERSATION_SNAPSHOT_MESSAGE_LIMIT
+    );
+    const messages = await ctx.db
+      .query("platformConversationMessages")
+      .withIndex("by_user_conversation_created_at", (q) =>
+        q
+          .eq("userId", args.userId)
+          .eq("conversationId", conversation.conversationId)
+      )
+      .order("desc")
+      .take(messageLimit);
+
+    return {
+      conversation,
+      messages: sortMessagesByTime(messages),
+    };
+  },
+});
+
+/**
+ * Resolve the server-owned conversation ID without loading message history.
+ * Media actions use this fast path before they initialize an external provider.
+ */
+export const getConversationIdentityForProspectInternal = internalQuery({
+  args: {
+    userId: v.id("users"),
+    prospectId: v.id("prospects"),
+    platform: platformConversationPlatformValidator,
+  },
+  returns: v.union(
+    v.null(),
+    v.object({
+      conversationId: v.string(),
+      participantUserId: v.optional(v.string()),
+    })
+  ),
+  handler: async (ctx, args) => {
+    const conversation = await ctx.db
+      .query("platformConversations")
+      .withIndex("by_user_prospect_platform", (q) =>
+        q
+          .eq("userId", args.userId)
+          .eq("prospectId", args.prospectId)
+          .eq("platform", args.platform)
+      )
+      .first();
+
+    return conversation
+      ? {
+          conversationId: conversation.conversationId,
+          participantUserId: conversation.participantUserId,
+        }
+      : null;
+  },
+});
+
+export const getConversationByUserAndConversationIdInternal = internalQuery({
+  args: {
+    userId: v.id("users"),
+    conversationId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("platformConversations")
+      .withIndex("by_user_conversation", (q) =>
+        q.eq("userId", args.userId).eq("conversationId", args.conversationId)
+      )
+      .first();
+  },
+});
+
+/**
+ * Resolve the one-to-one legacy DM conversation identified by X's documented
+ * typing payload. If the sender maps to more than one conversation, do not
+ * guess which panel should receive the presence update.
+ */
+export const getTwitterConversationForTypingInternal = internalQuery({
+  args: {
+    userId: v.id("users"),
+    participantUserId: v.string(),
+  },
+  returns: v.union(
+    v.null(),
+    v.object({
+      platform: v.literal("twitter"),
+      conversationId: v.string(),
+      participantUserId: v.optional(v.string()),
+      prospectId: v.optional(v.id("prospects")),
+    })
+  ),
+  handler: async (ctx, args) => {
+    const conversations = await ctx.db
+      .query("platformConversations")
+      .withIndex("by_user_platform_and_participant_user_id", (q) =>
+        q
+          .eq("userId", args.userId)
+          .eq("platform", "twitter")
+          .eq("participantUserId", args.participantUserId)
+      )
+      .take(2);
+
+    if (conversations.length !== 1) {
+      return null;
+    }
+
+    const conversation = conversations[0]!;
+    return {
+      platform: "twitter" as const,
+      conversationId: conversation.conversationId,
+      participantUserId: conversation.participantUserId,
+      prospectId: conversation.prospectId,
+    };
+  },
+});
+
+export const getConversationMessageInternal = internalQuery({
+  args: {
+    userId: v.id("users"),
+    conversationId: v.string(),
+    messageId: v.string(),
+  },
+  returns: v.union(v.null(), platformConversationMessageLookupValidator),
+  handler: async (ctx, args) => {
+    const message = await ctx.db
+      .query("platformConversationMessages")
+      .withIndex("by_user_conversation_message", (q) =>
+        q
+          .eq("userId", args.userId)
+          .eq("conversationId", args.conversationId)
+          .eq("messageId", args.messageId)
+      )
+      .first();
+    return message
+      ? {
+          messageId: message.messageId,
+          providerMessageId: message.providerMessageId,
+          text: message.text,
+          attachments: message.attachments,
+        }
+      : null;
+  },
+});
+
+export const upsertConversationSnapshotInternal = internalMutation({
+  args: {
+    userId: v.id("users"),
+    workspaceId: v.optional(v.id("workspaces")),
+    prospectId: v.optional(v.id("prospects")),
+    platform: platformConversationPlatformValidator,
+    conversationId: v.string(),
+    accountId: v.optional(v.string()),
+    sourceId: v.optional(v.string()),
+    participantUserId: v.optional(v.string()),
+    participantAttendeeId: v.optional(v.string()),
+    participantProviderId: v.optional(v.string()),
+    participantUsername: v.optional(v.string()),
+    participantName: v.optional(v.string()),
+    participantHeadline: v.optional(v.string()),
+    participantAvatarUrl: v.optional(v.string()),
+    participantProfileUrl: v.optional(v.string()),
+    participantVerified: v.optional(v.boolean()),
+    eligibilityEnabled: v.optional(v.boolean()),
+    eligibilityReasonCode: v.optional(xDmEligibilityReasonCodeValidator),
+    eligibilityReasonLabel: v.optional(v.string()),
+    disabledFeatures: v.optional(v.array(v.string())),
+    readOnly: v.optional(v.boolean()),
+    contentType: v.optional(v.string()),
+    lastSyncedAt: v.optional(v.number()),
+    lastSyncAttemptAt: v.optional(v.number()),
+    lastSyncSuccessAt: v.optional(v.number()),
+    nextSyncAllowedAt: v.optional(v.number()),
+    lastSyncErrorCode: v.optional(xDmPanelWarningCodeValidator),
+    lastSyncErrorMessage: v.optional(v.string()),
+    historyNextCursor: v.optional(v.string()),
+    historyHasMore: v.optional(v.boolean()),
+    historyBoundary: v.optional(conversationHistoryBoundaryValidator),
+    historyOldestLoadedAt: v.optional(v.number()),
+    activitySubscribedAt: v.optional(v.number()),
+    messages: v.array(
+      v.object({
+        messageId: v.string(),
+        providerMessageId: v.optional(v.string()),
+        direction: platformConversationDirectionValidator,
+        senderUserId: v.optional(v.string()),
+        senderAttendeeId: v.optional(v.string()),
+        text: v.optional(v.string()),
+        createdAt: v.optional(v.string()),
+        createdAtMs: v.number(),
+        attachments: v.optional(
+          v.array(platformConversationAttachmentValidator)
+        ),
+        readAt: v.optional(v.number()),
+        deliveredAt: v.optional(v.number()),
+        quotedMessageId: v.optional(v.string()),
+        quotedMessage: v.optional(platformConversationQuotedMessageValidator),
+        sharedPost: v.optional(platformConversationSharedPostValidator),
+        reactions: v.optional(v.array(platformConversationReactionValidator)),
+        editedAt: v.optional(v.number()),
+        deletedAt: v.optional(v.number()),
+        seenBy: v.optional(v.array(platformConversationSeenByValidator)),
+        messageType: v.optional(platformConversationMessageTypeValidator),
+        isEvent: v.optional(v.boolean()),
+        sourceEventType: v.optional(platformConversationEventTypeValidator),
+        eventMetadata: v.optional(platformConversationEventMetadataValidator),
+      })
+    ),
+  },
+  handler: async (ctx, args) => {
+    const now = getCurrentUTCTimestamp();
+    const didSyncSucceed = typeof args.lastSyncSuccessAt === "number";
+    const hasNewHistoryState = typeof args.historyHasMore === "boolean";
+    const existingConversation = await ctx.db
+      .query("platformConversations")
+      .withIndex("by_user_conversation", (q) =>
+        q.eq("userId", args.userId).eq("conversationId", args.conversationId)
+      )
+      .first();
+
+    const sortedMessages = sortMessagesByTime(args.messages);
+    const latestMessage =
+      sortedMessages.length > 0
+        ? sortedMessages[sortedMessages.length - 1]
+        : undefined;
+
+    const conversationPatch = {
+      workspaceId: args.workspaceId,
+      prospectId: args.prospectId,
+      platform: args.platform,
+      conversationId: args.conversationId,
+      accountId: args.accountId,
+      sourceId: args.sourceId,
+      participantUserId: args.participantUserId,
+      participantAttendeeId: args.participantAttendeeId,
+      participantProviderId: args.participantProviderId,
+      participantUsername: args.participantUsername,
+      participantName: args.participantName,
+      participantHeadline: args.participantHeadline,
+      participantAvatarUrl: args.participantAvatarUrl,
+      participantProfileUrl: args.participantProfileUrl,
+      participantVerified: args.participantVerified,
+      eligibilityEnabled: args.eligibilityEnabled,
+      eligibilityReasonCode: args.eligibilityReasonCode,
+      eligibilityReasonLabel: args.eligibilityReasonLabel,
+      disabledFeatures: args.disabledFeatures,
+      readOnly: args.readOnly,
+      contentType: args.contentType,
+      latestMessageId:
+        latestMessage?.messageId ?? existingConversation?.latestMessageId,
+      latestMessageAt:
+        latestMessage?.createdAtMs ?? existingConversation?.latestMessageAt,
+      lastSyncedAt: args.lastSyncedAt ?? existingConversation?.lastSyncedAt,
+      lastSyncAttemptAt: pickOptionalPatchValue(
+        args,
+        "lastSyncAttemptAt",
+        existingConversation?.lastSyncAttemptAt
+      ),
+      lastSyncSuccessAt: pickOptionalPatchValue(
+        args,
+        "lastSyncSuccessAt",
+        existingConversation?.lastSyncSuccessAt
+      ),
+      nextSyncAllowedAt: didSyncSucceed
+        ? undefined
+        : pickOptionalPatchValue(
+            args,
+            "nextSyncAllowedAt",
+            existingConversation?.nextSyncAllowedAt
+          ),
+      lastSyncErrorCode: didSyncSucceed
+        ? undefined
+        : pickOptionalPatchValue(
+            args,
+            "lastSyncErrorCode",
+            existingConversation?.lastSyncErrorCode
+          ),
+      lastSyncErrorMessage: didSyncSucceed
+        ? undefined
+        : pickOptionalPatchValue(
+            args,
+            "lastSyncErrorMessage",
+            existingConversation?.lastSyncErrorMessage
+          ),
+      historyNextCursor: hasNewHistoryState
+        ? args.historyHasMore
+          ? args.historyNextCursor
+          : undefined
+        : existingConversation?.historyNextCursor,
+      historyHasMore: pickOptionalPatchValue(
+        args,
+        "historyHasMore",
+        existingConversation?.historyHasMore
+      ),
+      historyBoundary: hasNewHistoryState
+        ? args.historyBoundary
+        : existingConversation?.historyBoundary,
+      historyOldestLoadedAt:
+        typeof args.historyOldestLoadedAt === "number"
+          ? Math.min(
+              args.historyOldestLoadedAt,
+              existingConversation?.historyOldestLoadedAt ?? Infinity
+            )
+          : existingConversation?.historyOldestLoadedAt,
+      activitySubscribedAt:
+        args.activitySubscribedAt ?? existingConversation?.activitySubscribedAt,
+      updatedAt: now,
+    };
+
+    const conversationContentPatch = {
+      workspaceId: args.workspaceId,
+      prospectId: args.prospectId,
+      accountId: args.accountId,
+      sourceId: args.sourceId,
+      participantUserId: args.participantUserId,
+      participantAttendeeId: args.participantAttendeeId,
+      participantProviderId: args.participantProviderId,
+      participantUsername: args.participantUsername,
+      participantName: args.participantName,
+      participantHeadline: args.participantHeadline,
+      participantAvatarUrl: args.participantAvatarUrl,
+      participantProfileUrl: args.participantProfileUrl,
+      participantVerified: args.participantVerified,
+      eligibilityEnabled: args.eligibilityEnabled,
+      eligibilityReasonCode: args.eligibilityReasonCode,
+      eligibilityReasonLabel: args.eligibilityReasonLabel,
+      disabledFeatures: args.disabledFeatures,
+      readOnly: args.readOnly,
+      contentType: args.contentType,
+      latestMessageId: conversationPatch.latestMessageId,
+      latestMessageAt: conversationPatch.latestMessageAt,
+    };
+    let didContentChange = existingConversation
+      ? buildChangedPatch(
+          existingConversation as unknown as Record<string, unknown>,
+          conversationContentPatch
+        ) !== null
+      : true;
+
+    const conversationId = existingConversation
+      ? existingConversation._id
+      : await ctx.db.insert("platformConversations", {
+          userId: args.userId,
+          ...conversationPatch,
+          contentUpdatedAt: now,
+        });
+
+    if (existingConversation) {
+      const patch = buildChangedPatchWithUpdatedAt(
+        existingConversation as unknown as Record<string, unknown>,
+        conversationPatch,
+        now
+      );
+      if (patch) {
+        await ctx.db.patch(existingConversation._id, patch);
+      }
+    }
+
+    for (const message of sortedMessages) {
+      const existingMessage = await ctx.db
+        .query("platformConversationMessages")
+        .withIndex("by_user_conversation_message", (q) =>
+          q
+            .eq("userId", args.userId)
+            .eq("conversationId", args.conversationId)
+            .eq("messageId", message.messageId)
+        )
+        .first();
+
+      const payload = {
+        workspaceId: args.workspaceId,
+        prospectId: args.prospectId,
+        platform: args.platform,
+        conversationId: args.conversationId,
+        messageId: message.messageId,
+        providerMessageId: message.providerMessageId,
+        direction: message.direction,
+        senderUserId: message.senderUserId,
+        senderAttendeeId: message.senderAttendeeId,
+        text: message.text,
+        createdAt: message.createdAt,
+        createdAtMs: message.createdAtMs,
+        attachments: mergeConversationAttachments(
+          message.attachments,
+          existingMessage?.attachments
+        ),
+        readAt: message.readAt ?? existingMessage?.readAt,
+        deliveredAt: message.deliveredAt ?? existingMessage?.deliveredAt,
+        quotedMessageId:
+          message.quotedMessageId ?? existingMessage?.quotedMessageId,
+        quotedMessage: mergeConversationQuotedMessage(
+          message.quotedMessage,
+          existingMessage?.quotedMessage
+        ),
+        sharedPost: mergeConversationSharedPost(
+          message.sharedPost,
+          existingMessage?.sharedPost
+        ),
+        reactions: message.reactions ?? existingMessage?.reactions,
+        editedAt: message.editedAt ?? existingMessage?.editedAt,
+        deletedAt: message.deletedAt ?? existingMessage?.deletedAt,
+        seenBy: message.seenBy ?? existingMessage?.seenBy,
+        messageType: message.messageType ?? existingMessage?.messageType,
+        isEvent: message.isEvent ?? existingMessage?.isEvent,
+        sourceEventType:
+          message.sourceEventType ?? existingMessage?.sourceEventType,
+        eventMetadata: message.eventMetadata ?? existingMessage?.eventMetadata,
+        updatedAt: now,
+      };
+
+      if (existingMessage) {
+        const patch = buildChangedPatchWithUpdatedAt(
+          existingMessage as unknown as Record<string, unknown>,
+          payload,
+          now
+        );
+        if (patch) {
+          await ctx.db.patch(existingMessage._id, patch);
+          didContentChange = true;
+        }
+      } else {
+        await ctx.db.insert("platformConversationMessages", {
+          userId: args.userId,
+          ...payload,
+        });
+        didContentChange = true;
+      }
+    }
+
+    if (existingConversation && didContentChange) {
+      await ctx.db.patch(existingConversation._id, { contentUpdatedAt: now });
+    }
+
+    return {
+      conversationId,
+      latestMessageAt: latestMessage?.createdAtMs,
+      messageCount: sortedMessages.length,
+    };
+  },
+});
+
+export const markConversationMessagesReadInternal = internalMutation({
+  args: {
+    userId: v.id("users"),
+    conversationId: v.string(),
+    readAt: v.number(),
+    seenBy: v.optional(v.array(platformConversationSeenByValidator)),
+    cursor: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const page = await ctx.db
+      .query("platformConversationMessages")
+      .withIndex("by_user_conversation_direction_created_at", (q) =>
+        q
+          .eq("userId", args.userId)
+          .eq("conversationId", args.conversationId)
+          .eq("direction", "sent")
+      )
+      .paginate({
+        cursor: args.cursor ?? null,
+        numItems: READ_RECEIPT_UPDATE_BATCH_SIZE,
+      });
+    const now = getCurrentUTCTimestamp();
+    const staleMessages = page.page.filter(
+      (message) =>
+        typeof message.readAt !== "number" || message.readAt < args.readAt
+    );
+
+    await Promise.all(
+      staleMessages.map((message) =>
+        ctx.db.patch(message._id, {
+          readAt: args.readAt,
+          seenBy: args.seenBy ?? message.seenBy,
+          updatedAt: now,
+        })
+      )
+    );
+
+    if (!page.isDone) {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.platformConversations.markConversationMessagesReadInternal,
+        {
+          userId: args.userId,
+          conversationId: args.conversationId,
+          readAt: args.readAt,
+          seenBy: args.seenBy,
+          cursor: page.continueCursor,
+        }
+      );
+    }
+
+    if (!args.cursor) {
+      const conversation = await ctx.db
+        .query("platformConversations")
+        .withIndex("by_user_conversation", (q) =>
+          q.eq("userId", args.userId).eq("conversationId", args.conversationId)
+        )
+        .first();
+
+      if (
+        conversation &&
+        (typeof conversation.lastReadAt !== "number" ||
+          conversation.lastReadAt < args.readAt)
+      ) {
+        await ctx.db.patch(conversation._id, {
+          lastReadAt: args.readAt,
+          contentUpdatedAt: now,
+          updatedAt: now,
+        });
+      }
+    }
+
+    return {
+      success: true,
+      processedCount: staleMessages.length,
+      hasMore: !page.isDone,
+    };
+  },
+});
+
+export const upsertXActivitySubscriptionInternal = internalMutation({
+  args: {
+    userId: v.id("users"),
+    xUserId: v.string(),
+    eventType: xActivityEventTypeValidator,
+    subscriptionId: v.string(),
+    webhookId: v.optional(v.string()),
+    tag: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const now = getCurrentUTCTimestamp();
+    const existing = await ctx.db
+      .query("xActivitySubscriptions")
+      .withIndex("by_user_event", (q) =>
+        q.eq("userId", args.userId).eq("eventType", args.eventType)
+      )
+      .first();
+
+    const payload = {
+      xUserId: args.xUserId,
+      eventType: args.eventType,
+      subscriptionId: args.subscriptionId,
+      webhookId: args.webhookId,
+      tag: args.tag,
+      updatedAt: now,
+    };
+
+    if (existing) {
+      const patch = buildChangedPatchWithUpdatedAt(
+        existing as unknown as Record<string, unknown>,
+        payload,
+        now
+      );
+      if (patch) {
+        await ctx.db.patch(existing._id, patch);
+      }
+      return existing._id;
+    }
+
+    return await ctx.db.insert("xActivitySubscriptions", {
+      userId: args.userId,
+      ...payload,
+    });
+  },
+});
+
+export const getXActivitySubscriptionByIdInternal = internalQuery({
+  args: {
+    subscriptionId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("xActivitySubscriptions")
+      .withIndex("by_subscription_id", (q) =>
+        q.eq("subscriptionId", args.subscriptionId)
+      )
+      .first();
+  },
+});
+
+export const listXActivitySubscriptionsForUserInternal = internalQuery({
+  args: {
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("xActivitySubscriptions")
+      .withIndex("by_user_event", (q) => q.eq("userId", args.userId))
+      .collect();
+  },
+});
+
+export const upsertXWebhookInternal = internalMutation({
+  args: {
+    webhookId: v.string(),
+    url: v.string(),
+    valid: v.boolean(),
+    lastValidatedAt: v.optional(v.number()),
+    lastError: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const now = getCurrentUTCTimestamp();
+    const existing = await ctx.db
+      .query("xWebhooks")
+      .withIndex("by_webhook_id", (q) => q.eq("webhookId", args.webhookId))
+      .first();
+
+    const payload = {
+      url: args.url,
+      valid: args.valid,
+      updatedAt: now,
+      lastValidatedAt: args.lastValidatedAt,
+      lastError: args.lastError,
+    };
+
+    if (existing) {
+      const patch = buildChangedPatchWithUpdatedAt(
+        existing as unknown as Record<string, unknown>,
+        payload,
+        now
+      );
+      if (patch) {
+        await ctx.db.patch(existing._id, patch);
+      }
+      return existing._id;
+    }
+
+    return await ctx.db.insert("xWebhooks", {
+      webhookId: args.webhookId,
+      ...payload,
+    });
+  },
+});
+
+export const getXWebhookByUrlInternal = internalQuery({
+  args: {
+    url: v.string(),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("xWebhooks")
+      .withIndex("by_url", (q) => q.eq("url", args.url))
+      .first();
+  },
+});
+
+export const listXWebhooksInternal = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    return await ctx.db.query("xWebhooks").take(25);
+  },
+});

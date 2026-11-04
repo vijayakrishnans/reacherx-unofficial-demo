@@ -1,0 +1,933 @@
+import {
+  defineCatalog,
+  type InferComponentProps,
+  type Spec,
+} from "@json-render/core";
+import { schema } from "@json-render/react/schema";
+import { z } from "zod";
+import {
+  BLOG_DEMO_SHOTS,
+  isBlogDemoId,
+} from "@/features/blog/lib/blogDemoHelpers";
+import { getTwitterPostRef, summarizeTwitterPost } from "../twitter/contracts";
+
+export const AGENT_ARTIFACT_KIND = "reacherx-agent-artifact";
+export const AGENT_ARTIFACT_VERSION = 1 as const;
+
+export const agentArtifactTaskSchema = z.object({
+  _id: z.string(),
+  order: z.number(),
+  type: z.string(),
+  description: z.string(),
+  status: z.string(),
+  content: z.string().optional(),
+  targetTweetId: z.string().optional(),
+});
+
+export const agentArtifactProgressStepSchema = z.object({
+  step: z.string(),
+  status: z.enum(["pending", "running", "completed", "failed"]),
+  details: z.string().optional(),
+  count: z.number().optional(),
+});
+
+const profilePreviewVariantSchema = z.enum(["prospect", "twitter", "linkedin"]);
+
+const twitterPostRefSchema = z.object({
+  platform: z.literal("twitter"),
+  postId: z.string(),
+  conversationId: z.string().optional(),
+  authorId: z.string().optional(),
+  authorHandle: z.string().optional(),
+  url: z.string().optional(),
+});
+
+const twitterAuthorSummarySchema = z.object({
+  id: z.string().optional(),
+  handle: z.string().optional(),
+  name: z.string().optional(),
+  avatarUrl: z.string().optional(),
+  profileUrl: z.string().optional(),
+});
+
+const twitterMetricsSummarySchema = z.object({
+  replies: z.number().optional(),
+  reposts: z.number().optional(),
+  likes: z.number().optional(),
+  quotes: z.number().optional(),
+  views: z.number().optional(),
+  bookmarks: z.number().optional(),
+});
+
+const twitterMediaSummarySchema = z.object({
+  type: z.enum(["photo", "video", "animated_gif", "link"]),
+  url: z.string(),
+  previewUrl: z.string().optional(),
+  altText: z.string().optional(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+});
+
+const twitterPostSummarySchema = z.object({
+  platform: z.literal("twitter"),
+  ref: twitterPostRefSchema,
+  url: z.string(),
+  textPreview: z.string(),
+  createdAt: z.number().optional(),
+  author: twitterAuthorSummarySchema.optional(),
+  metrics: twitterMetricsSummarySchema.optional(),
+  media: z.array(twitterMediaSummarySchema).optional(),
+  inReplyToPostId: z.string().optional(),
+  inReplyToHandle: z.string().optional(),
+  quotePostId: z.string().optional(),
+  lang: z.string().optional(),
+  source: z.string().optional(),
+});
+
+const blogDemoArtifactPropsSchema = z
+  .object({
+    scenario: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/i),
+    title: z.string(),
+    caption: z.string(),
+    sceneRange: z
+      .tuple([z.number().int().min(0), z.number().int().min(0)])
+      .optional(),
+    sourceUrl: z.string().url().nullable().optional(),
+  })
+  .superRefine((props, context) => {
+    if (!isBlogDemoId(props.scenario)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["scenario"],
+        message: "Unknown blog demo scenario",
+      });
+      return;
+    }
+
+    const shotCount = BLOG_DEMO_SHOTS[props.scenario].length;
+
+    const sceneRange = props.sceneRange;
+    if (
+      sceneRange &&
+      (sceneRange[0] > sceneRange[1] || sceneRange[1] >= shotCount)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["sceneRange"],
+        message: "sceneRange must fit the selected blog demo",
+      });
+    }
+  });
+
+export const agentArtifactCatalog = defineCatalog(schema, {
+  components: {
+    OnboardingCard: {
+      props: z.object({
+        workspaceId: z.string(),
+      }),
+      description:
+        "Shows onboarding/prospecting setup progress for a workspace.",
+    },
+    ProgressStatusCard: {
+      props: z.object({
+        title: z.string().nullable().optional(),
+        message: z.string().nullable().optional(),
+        progress: z.array(agentArtifactProgressStepSchema),
+        totalProspects: z.number().nullable().optional(),
+      }),
+      description:
+        "Shows structured progress or status from agent workflows such as prospect search.",
+    },
+    PostArtifact: {
+      props: z.object({
+        platform: z.enum(["twitter", "linkedin"]),
+        prospectId: z.string().nullable().optional(),
+        openKind: z.enum(["post", "post_list"]).nullable().optional(),
+        postData: z.any().nullable().optional(),
+        postRef: twitterPostRefSchema.nullable().optional(),
+        postSummary: twitterPostSummarySchema.nullable().optional(),
+        context: z.string().nullable().optional(),
+        taskId: z.string().nullable().optional(),
+        taskStatus: z.string().nullable().optional(),
+        panelMode: z.enum(["approval", "posted"]).nullable().optional(),
+        targetTweetId: z.string().nullable().optional(),
+        interactive: z.boolean().nullable().optional(),
+      }),
+      description:
+        "Displays a Twitter or LinkedIn post artifact in chat, optionally opening a related panel.",
+    },
+    ProfilePreviewCard: {
+      props: z.object({
+        variant: profilePreviewVariantSchema,
+        prospectId: z.string().nullable().optional(),
+        platform: z.enum(["twitter", "linkedin"]).nullable().optional(),
+        profileData: z.any(),
+        label: z.string().nullable().optional(),
+        context: z.string().nullable().optional(),
+        interactive: z.boolean().nullable().optional(),
+      }),
+      description:
+        "Displays the top-section inline preview for a generic or platform-specific profile.",
+    },
+    PostListArtifact: {
+      props: z.object({
+        platform: z.enum(["twitter", "linkedin"]),
+        title: z.string(),
+        prospectId: z.string().nullable().optional(),
+        context: z.string().nullable().optional(),
+        posts: z.array(
+          z.object({
+            id: z.string(),
+            platform: z.enum(["twitter", "linkedin"]),
+            textPreview: z.string(),
+            createdAt: z.number().nullable().optional(),
+            postData: z.any().nullable().optional(),
+            postRef: twitterPostRefSchema.nullable().optional(),
+            postSummary: twitterPostSummarySchema.nullable().optional(),
+          })
+        ),
+        interactive: z.boolean().nullable().optional(),
+      }),
+      description:
+        "Displays a compact inline preview of multiple posts and opens the canonical posts panel.",
+    },
+    PlanPreviewCard: {
+      props: z.object({
+        planId: z.string().nullable().optional(),
+        prospectId: z.string().nullable().optional(),
+        status: z.string(),
+        rationale: z.string(),
+        tasks: z.array(agentArtifactTaskSchema),
+      }),
+      description:
+        "Shows a compact outreach plan preview with strategy summary and optional approval affordances.",
+    },
+    PlanBatchProgressCard: {
+      props: z.object({
+        runId: z.string(),
+      }),
+      description:
+        "Shows live progress for a durable create, update, or create-or-update plan batch.",
+    },
+    MemoryCard: {
+      props: z.object({
+        memoryId: z.string(),
+        workspaceId: z.string().nullable().optional(),
+        prospectId: z.string().nullable().optional(),
+        title: z.string(),
+        category: z.string(),
+        source: z.string(),
+        confidence: z.number(),
+        impactScore: z.number(),
+      }),
+      description:
+        "Slim tool-call-style confirmation for a saved workspace memory, with a deep link into Agent observability.",
+    },
+    WorkspaceProfileChangeCard: {
+      props: z.object({
+        requestId: z.string(),
+      }),
+      description:
+        "Shows a durable workspace-wide ideal-profile proposal with explicit approval controls.",
+    },
+    TwitterActionCard: {
+      props: z.object({
+        platform: z.enum(["twitter", "linkedin"]).nullable().optional(),
+        actionKey: z.string(),
+        actionRequestId: z.string().nullable().optional(),
+        title: z.string(),
+        message: z.string().nullable().optional(),
+        status: z.string(),
+        approvalMode: z.string().nullable().optional(),
+        riskLevel: z.string().nullable().optional(),
+        eligibilityReasonCode: z.string().nullable().optional(),
+        targetTweetId: z.string().nullable().optional(),
+        sourcePostData: z.any().nullable().optional(),
+        sourcePostRef: twitterPostRefSchema.nullable().optional(),
+        sourcePostSummary: twitterPostSummarySchema.nullable().optional(),
+        sourceContext: z.string().nullable().optional(),
+        draftContent: z.string().nullable().optional(),
+        createdTweetId: z.string().nullable().optional(),
+        interactive: z.boolean().nullable().optional(),
+      }),
+      description:
+        "Displays a durable Twitter action request or completion state, with optional approval and review affordances.",
+    },
+    DmDraftCard: {
+      props: z.object({
+        platform: z.enum(["twitter", "linkedin"]).nullable().optional(),
+        prospectId: z.string(),
+        actionRequestId: z.string(),
+        title: z.string(),
+        message: z.string().nullable().optional(),
+        status: z.string(),
+        draftContent: z.string().nullable().optional(),
+      }),
+      description:
+        "Displays an inline DM preview card for a staged X message draft with send/cancel/open actions.",
+    },
+    AttachmentPreview: {
+      props: z.object({
+        attachments: z.array(
+          z.object({
+            attachmentRef: z.string(),
+            fileName: z.string(),
+            displayName: z.string(),
+            mimeType: z.string(),
+            mediaKind: z.enum(["image", "gif", "video", "file"]),
+            size: z.number(),
+            uploadedAt: z.number(),
+            mediaUrl: z.string(),
+          })
+        ),
+      }),
+      description:
+        "Displays workspace attachments inline using the existing attachment presentation.",
+    },
+    BlogCardArtifact: {
+      props: z.object({
+        slug: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/i),
+        title: z.string().nullable().optional(),
+        description: z.string().nullable().optional(),
+        sourceUrl: z.string().url().nullable().optional(),
+      }),
+      description:
+        "Displays an existing ReacherX blog card when a ReacherX guide is relevant.",
+    },
+    BlogDemoArtifact: {
+      props: blogDemoArtifactPropsSchema,
+      description:
+        "Displays an existing ReacherX interactive blog demo from a validated scenario reference.",
+    },
+  },
+  actions: {},
+});
+
+export type AgentArtifactSpec = Spec;
+export type AgentArtifactTask = z.infer<typeof agentArtifactTaskSchema>;
+export type AgentArtifactProgressStep = z.infer<
+  typeof agentArtifactProgressStepSchema
+>;
+
+export interface AgentArtifactEnvelope {
+  kind: typeof AGENT_ARTIFACT_KIND;
+  version: typeof AGENT_ARTIFACT_VERSION;
+  spec: AgentArtifactSpec;
+}
+
+export interface AgentArtifactPostMentionCandidate {
+  platform: "twitter" | "linkedin";
+  prospectId?: string;
+  postData?: unknown;
+  postRef?: unknown;
+  postSummary?: unknown;
+}
+
+type AgentArtifactComponent = keyof typeof agentArtifactCatalog.data.components;
+type AgentArtifactComponentProps<T extends AgentArtifactComponent> =
+  InferComponentProps<typeof agentArtifactCatalog, T>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function getStringProperty(
+  value: Record<string, unknown>,
+  key: string
+): string | null {
+  const property = value[key];
+  return typeof property === "string" && property.trim().length > 0
+    ? property
+    : null;
+}
+
+function getArtifactRoot(envelope: AgentArtifactEnvelope) {
+  const spec = envelope.spec as unknown;
+  if (!isRecord(spec)) return null;
+
+  const elements = spec.elements;
+  if (!isRecord(elements)) return null;
+
+  const rootId = getStringProperty(spec, "root");
+  const root = rootId ? elements[rootId] : elements.artifact;
+  if (!isRecord(root)) return null;
+
+  const type = getStringProperty(root, "type");
+  const props = root.props;
+  if (!type || !isRecord(props)) return null;
+
+  return { type, props };
+}
+
+function getProfileDataId(props: Record<string, unknown>): string | null {
+  const profileData = props.profileData;
+  if (!isRecord(profileData)) return null;
+  return getStringProperty(profileData, "id");
+}
+
+function getPostRefId(props: Record<string, unknown>): string | null {
+  const postRef = props.postRef;
+  if (!isRecord(postRef)) return null;
+  return getStringProperty(postRef, "postId");
+}
+
+function getPostDataId(props: Record<string, unknown>): string | null {
+  const postData = props.postData;
+  if (!isRecord(postData)) return null;
+  return (
+    getStringProperty(postData, "id") ?? getStringProperty(postData, "url")
+  );
+}
+
+function getPostListIds(props: Record<string, unknown>): string | null {
+  const posts = props.posts;
+  if (!Array.isArray(posts)) return null;
+
+  const ids = posts
+    .map((post) => {
+      if (!isRecord(post)) return null;
+      return (
+        getStringProperty(post, "id") ??
+        getPostRefId(post) ??
+        getPostDataId(post)
+      );
+    })
+    .filter((id): id is string => id !== null);
+
+  return ids.length > 0 ? ids.join(",") : null;
+}
+
+export function getAgentArtifactSemanticKey(
+  envelope: AgentArtifactEnvelope
+): string | null {
+  const root = getArtifactRoot(envelope);
+  if (!root) return null;
+
+  const { type, props } = root;
+  if (type === "ProfilePreviewCard") {
+    const variant = getStringProperty(props, "variant") ?? "profile";
+    const platform = getStringProperty(props, "platform") ?? "auto";
+    const prospectId =
+      getStringProperty(props, "prospectId") ??
+      getProfileDataId(props) ??
+      "unknown";
+    return `${type}:${variant}:${platform}:${prospectId}`;
+  }
+
+  if (type === "PostArtifact") {
+    const platform = getStringProperty(props, "platform") ?? "auto";
+    const prospectId = getStringProperty(props, "prospectId") ?? "unknown";
+    const postId =
+      getStringProperty(props, "targetTweetId") ??
+      getPostRefId(props) ??
+      getPostDataId(props) ??
+      "unknown";
+    return `${type}:${platform}:${prospectId}:${postId}`;
+  }
+
+  if (type === "PostListArtifact") {
+    const platform = getStringProperty(props, "platform") ?? "auto";
+    const prospectId = getStringProperty(props, "prospectId") ?? "unknown";
+    const title = getStringProperty(props, "title") ?? "posts";
+    const postIds = getPostListIds(props) ?? "unknown";
+    return `${type}:${platform}:${prospectId}:${title}:${postIds}`;
+  }
+
+  if (type === "PlanPreviewCard") {
+    const planId = getStringProperty(props, "planId");
+    return planId ? `${type}:${planId}` : null;
+  }
+
+  if (type === "WorkspaceProfileChangeCard") {
+    const requestId = getStringProperty(props, "requestId");
+    return requestId ? `${type}:${requestId}` : null;
+  }
+
+  if (type === "AttachmentPreview") {
+    const attachments = props.attachments;
+    if (!Array.isArray(attachments)) return null;
+    const attachmentRefs = attachments
+      .map((attachment) =>
+        isRecord(attachment)
+          ? getStringProperty(attachment, "attachmentRef")
+          : null
+      )
+      .filter((value): value is string => value !== null);
+    return attachmentRefs.length > 0
+      ? `${type}:${attachmentRefs.join(",")}`
+      : null;
+  }
+
+  if (type === "BlogCardArtifact") {
+    const slug = getStringProperty(props, "slug");
+    return slug ? `${type}:${slug}` : null;
+  }
+
+  if (type === "BlogDemoArtifact") {
+    const scenario = getStringProperty(props, "scenario");
+    if (!scenario) return null;
+    const sceneRange = Array.isArray(props.sceneRange)
+      ? props.sceneRange.join("-")
+      : "all";
+    return `${type}:${scenario}:${sceneRange}`;
+  }
+
+  return null;
+}
+
+export function extractPostMentionCandidatesFromArtifact(
+  envelope: AgentArtifactEnvelope
+): AgentArtifactPostMentionCandidate[] {
+  const root = getArtifactRoot(envelope);
+  if (!root) {
+    return [];
+  }
+
+  const { type, props } = root;
+  const prospectId = getStringProperty(props, "prospectId") ?? undefined;
+
+  if (type === "PostArtifact") {
+    const platform = getStringProperty(props, "platform");
+    if (platform !== "twitter" && platform !== "linkedin") {
+      return [];
+    }
+
+    return [
+      {
+        platform,
+        prospectId,
+        postData: props.postData,
+        postRef: props.postRef,
+        postSummary: props.postSummary,
+      },
+    ];
+  }
+
+  if (type === "PostListArtifact") {
+    const defaultPlatform = getStringProperty(props, "platform");
+    const posts = props.posts;
+    if (!Array.isArray(posts)) {
+      return [];
+    }
+
+    const candidates: AgentArtifactPostMentionCandidate[] = [];
+
+    for (const post of posts) {
+      if (!isRecord(post)) {
+        continue;
+      }
+
+      const platform =
+        getStringProperty(post, "platform") ?? defaultPlatform ?? null;
+      if (platform !== "twitter" && platform !== "linkedin") {
+        continue;
+      }
+
+      candidates.push({
+        platform,
+        prospectId,
+        postData: post.postData,
+        postRef: post.postRef,
+        postSummary: post.postSummary,
+      });
+    }
+
+    return candidates;
+  }
+
+  if (type === "TwitterActionCard") {
+    const platform = getStringProperty(props, "platform");
+    if (platform !== "twitter" && platform !== "linkedin") {
+      return [];
+    }
+
+    const hasSourcePost =
+      props.sourcePostData || props.sourcePostSummary || props.sourcePostRef;
+    if (!hasSourcePost) {
+      return [];
+    }
+
+    return [
+      {
+        platform,
+        prospectId,
+        postData: props.sourcePostData,
+        postRef: props.sourcePostRef,
+        postSummary: props.sourcePostSummary,
+      },
+    ];
+  }
+
+  return [];
+}
+
+function normalizeTwitterPostRef(value: unknown) {
+  return getTwitterPostRef(value) ?? null;
+}
+
+function normalizeTwitterPostSummary(value: unknown) {
+  return summarizeTwitterPost(value) ?? null;
+}
+
+function buildSingleElementSpec<T extends AgentArtifactComponent>(
+  type: T,
+  props: AgentArtifactComponentProps<T>
+): unknown {
+  return {
+    root: "artifact",
+    elements: {
+      artifact: {
+        type,
+        props,
+        visible: true,
+        children: [],
+      },
+    },
+  };
+}
+
+export function createAgentArtifact<T extends AgentArtifactComponent>(
+  type: T,
+  props: AgentArtifactComponentProps<T>
+): AgentArtifactEnvelope | undefined {
+  if (
+    type === "BlogDemoArtifact" &&
+    !blogDemoArtifactPropsSchema.safeParse(props).success
+  ) {
+    return undefined;
+  }
+
+  const result = agentArtifactCatalog.validate(
+    buildSingleElementSpec(type, props)
+  );
+  if (!result.success || !result.data) {
+    return undefined;
+  }
+
+  return {
+    kind: AGENT_ARTIFACT_KIND,
+    version: AGENT_ARTIFACT_VERSION,
+    spec: result.data as Spec,
+  };
+}
+
+export function validateAgentArtifactEnvelope(
+  value: unknown
+): AgentArtifactEnvelope | null {
+  if (!isRecord(value)) return null;
+  if (value.kind !== AGENT_ARTIFACT_KIND) return null;
+  if (value.version !== AGENT_ARTIFACT_VERSION) return null;
+
+  const validatedSpec = agentArtifactCatalog.validate(value.spec);
+  if (!validatedSpec.success || !validatedSpec.data) return null;
+
+  const artifact: AgentArtifactEnvelope = {
+    kind: AGENT_ARTIFACT_KIND,
+    version: AGENT_ARTIFACT_VERSION,
+    spec: validatedSpec.data as Spec,
+  };
+
+  const root = getArtifactRoot(artifact);
+  if (
+    root?.type === "BlogDemoArtifact" &&
+    !blogDemoArtifactPropsSchema.safeParse(root.props).success
+  ) {
+    return null;
+  }
+
+  return artifact;
+}
+
+export function getAgentArtifactFromResult(
+  value: unknown
+): AgentArtifactEnvelope | null {
+  if (!isRecord(value) || !("artifact" in value)) return null;
+  return validateAgentArtifactEnvelope(value.artifact);
+}
+
+export function createOnboardingArtifact(workspaceId: string) {
+  return createAgentArtifact("OnboardingCard", {
+    workspaceId,
+  });
+}
+
+export function createProgressStatusArtifact(input: {
+  title?: string | null;
+  message?: string | null;
+  progress?: AgentArtifactProgressStep[];
+  totalProspects?: number | null;
+}) {
+  return createAgentArtifact("ProgressStatusCard", {
+    title: input.title ?? null,
+    message: input.message ?? null,
+    progress: input.progress ?? [],
+    totalProspects: input.totalProspects ?? null,
+  });
+}
+
+export function createPostArtifact(input: {
+  platform: "twitter" | "linkedin";
+  prospectId?: string;
+  openKind?: "post" | "post_list";
+  postData?: unknown;
+  postRef?: unknown;
+  postSummary?: unknown;
+  context?: string;
+  taskId?: string;
+  taskStatus?: string;
+  panelMode?: "approval" | "posted";
+  targetTweetId?: string;
+  interactive?: boolean;
+}) {
+  const postRef =
+    input.platform === "twitter"
+      ? normalizeTwitterPostRef(input.postRef)
+      : null;
+  const postSummary =
+    input.platform === "twitter"
+      ? normalizeTwitterPostSummary(input.postSummary)
+      : null;
+
+  return createAgentArtifact("PostArtifact", {
+    platform: input.platform,
+    prospectId: input.prospectId ?? null,
+    openKind: input.openKind ?? "post",
+    postData: input.postData ?? null,
+    postRef,
+    postSummary,
+    context: input.context ?? null,
+    taskId: input.taskId ?? null,
+    taskStatus: input.taskStatus ?? null,
+    panelMode: input.panelMode ?? null,
+    targetTweetId: input.targetTweetId ?? null,
+    interactive: input.interactive ?? true,
+  });
+}
+
+export function createProfilePreviewArtifact(input: {
+  variant: "prospect" | "twitter" | "linkedin";
+  prospectId?: string;
+  platform?: "twitter" | "linkedin";
+  profileData: unknown;
+  label?: string;
+  context?: string;
+  interactive?: boolean;
+}) {
+  return createAgentArtifact("ProfilePreviewCard", {
+    variant: input.variant,
+    prospectId: input.prospectId ?? null,
+    platform: input.platform ?? null,
+    profileData: input.profileData,
+    label: input.label ?? null,
+    context: input.context ?? null,
+    interactive: input.interactive ?? true,
+  });
+}
+
+export function createPostListArtifact(input: {
+  platform: "twitter" | "linkedin";
+  title: string;
+  prospectId?: string;
+  context?: string;
+  posts: Array<{
+    id: string;
+    platform: "twitter" | "linkedin";
+    textPreview: string;
+    createdAt?: number;
+    postData?: unknown;
+    ref?: unknown;
+    summary?: unknown;
+  }>;
+  interactive?: boolean;
+}) {
+  return createAgentArtifact("PostListArtifact", {
+    platform: input.platform,
+    title: input.title,
+    prospectId: input.prospectId ?? null,
+    context: input.context ?? null,
+    posts: input.posts.map((post) => ({
+      id: post.id,
+      platform: post.platform,
+      textPreview: post.textPreview,
+      createdAt: post.createdAt ?? null,
+      postData: post.postData ?? null,
+      postRef:
+        post.platform === "twitter" ? normalizeTwitterPostRef(post.ref) : null,
+      postSummary:
+        post.platform === "twitter"
+          ? normalizeTwitterPostSummary(post.summary)
+          : null,
+    })),
+    interactive: input.interactive ?? true,
+  });
+}
+
+export function createPlanPreviewArtifact(input: {
+  planId?: string;
+  prospectId?: string;
+  status: string;
+  rationale: string;
+  tasks: AgentArtifactTask[];
+}) {
+  return createAgentArtifact("PlanPreviewCard", {
+    planId: input.planId ?? null,
+    prospectId: input.prospectId ?? null,
+    status: input.status,
+    rationale: input.rationale,
+    tasks: input.tasks,
+  });
+}
+
+export function createPlanBatchProgressArtifact(input: { runId: string }) {
+  return createAgentArtifact("PlanBatchProgressCard", {
+    runId: input.runId,
+  });
+}
+
+export function createMemoryArtifact(input: {
+  memoryId: string;
+  workspaceId?: string | null;
+  prospectId?: string | null;
+  title: string;
+  category: string;
+  source: string;
+  confidence: number;
+  impactScore: number;
+}) {
+  return createAgentArtifact("MemoryCard", {
+    memoryId: input.memoryId,
+    workspaceId: input.workspaceId ?? null,
+    prospectId: input.prospectId ?? null,
+    title: input.title,
+    category: input.category,
+    source: input.source,
+    confidence: input.confidence,
+    impactScore: input.impactScore,
+  });
+}
+
+export function createWorkspaceProfileChangeArtifact(input: {
+  requestId: string;
+}) {
+  return createAgentArtifact("WorkspaceProfileChangeCard", {
+    requestId: input.requestId,
+  });
+}
+
+export function createTwitterActionArtifact(input: {
+  platform?: "twitter" | "linkedin";
+  actionKey: string;
+  actionRequestId?: string;
+  title: string;
+  message?: string;
+  status: string;
+  approvalMode?: string;
+  riskLevel?: string;
+  eligibilityReasonCode?: string;
+  targetTweetId?: string;
+  sourcePostData?: unknown;
+  sourcePostRef?: unknown;
+  sourcePostSummary?: unknown;
+  sourceContext?: string;
+  draftContent?: string;
+  createdTweetId?: string;
+  interactive?: boolean;
+}) {
+  const platform =
+    input.platform ??
+    (input.actionKey.startsWith("linkedin_") ? "linkedin" : "twitter");
+  return createAgentArtifact("TwitterActionCard", {
+    platform,
+    actionKey: input.actionKey,
+    actionRequestId: input.actionRequestId ?? null,
+    title: input.title,
+    message: input.message ?? null,
+    status: input.status,
+    approvalMode: input.approvalMode ?? null,
+    riskLevel: input.riskLevel ?? null,
+    eligibilityReasonCode: input.eligibilityReasonCode ?? null,
+    targetTweetId: input.targetTweetId ?? null,
+    sourcePostData: input.sourcePostData ?? null,
+    sourcePostRef:
+      platform === "twitter"
+        ? normalizeTwitterPostRef(input.sourcePostRef)
+        : null,
+    sourcePostSummary:
+      platform === "twitter"
+        ? normalizeTwitterPostSummary(input.sourcePostSummary)
+        : null,
+    sourceContext: input.sourceContext ?? null,
+    draftContent: input.draftContent ?? null,
+    createdTweetId: input.createdTweetId ?? null,
+    interactive: input.interactive ?? true,
+  });
+}
+
+export function createDmDraftArtifact(input: {
+  platform?: "twitter" | "linkedin";
+  prospectId: string;
+  actionRequestId: string;
+  title: string;
+  message?: string;
+  status: string;
+  draftContent?: string;
+}) {
+  return createAgentArtifact("DmDraftCard", {
+    platform: input.platform ?? "twitter",
+    prospectId: input.prospectId,
+    actionRequestId: input.actionRequestId,
+    title: input.title,
+    message: input.message ?? null,
+    status: input.status,
+    draftContent: input.draftContent ?? null,
+  });
+}
+
+export function createAttachmentPreviewArtifact(input: {
+  attachments: Array<{
+    attachmentRef: string;
+    fileName: string;
+    displayName: string;
+    mimeType: string;
+    mediaKind: "image" | "gif" | "video" | "file";
+    size: number;
+    uploadedAt: number;
+    mediaUrl: string;
+  }>;
+}) {
+  return createAgentArtifact("AttachmentPreview", {
+    attachments: input.attachments,
+  });
+}
+
+export function createBlogCardArtifact(input: {
+  slug: string;
+  title?: string;
+  description?: string;
+  sourceUrl?: string;
+}) {
+  return createAgentArtifact("BlogCardArtifact", {
+    slug: input.slug,
+    title: input.title ?? null,
+    description: input.description ?? null,
+    sourceUrl: input.sourceUrl ?? null,
+  });
+}
+
+export function createBlogDemoArtifact(input: {
+  scenario: string;
+  title: string;
+  caption: string;
+  sceneRange?: readonly [number, number];
+  sourceUrl?: string;
+}) {
+  return createAgentArtifact("BlogDemoArtifact", {
+    scenario: input.scenario,
+    title: input.title,
+    caption: input.caption,
+    sceneRange: input.sceneRange
+      ? [input.sceneRange[0], input.sceneRange[1]]
+      : undefined,
+    sourceUrl: input.sourceUrl ?? null,
+  });
+}

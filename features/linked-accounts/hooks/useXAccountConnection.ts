@@ -1,0 +1,316 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useAction } from "convex/react";
+import { useQueryWithStatus } from "@/shared/hooks/useQueryWithStatus";
+import { parseAsString, useQueryStates } from "nuqs";
+import { api } from "@/convex/_generated/api";
+import { showStyleSyncIssueToast } from "@/features/linked-accounts/lib/styleSyncIssueToast";
+import { logger } from "@/shared/lib/logger";
+import { toast } from "sonner";
+import { clearXChatBrowserData } from "@/features/agent/lib/xChatBrowserSession";
+
+export type TwitterConnectionStatus = {
+  isConnected: boolean;
+  status?: "connected" | "expired" | "reconnect_required" | "disconnected";
+  connectedAccountId?: string;
+  screenName?: string;
+  name?: string;
+  profileImageUrl?: string;
+  verified?: boolean;
+  missingScopes?: string[];
+  expiresAt?: number;
+  /** Ms since epoch; mirrors Convex `xAccounts._creationTime` when connected. */
+  connectedAt?: number;
+  styleSyncIssue?: {
+    key: string;
+    lastError?: string;
+  };
+};
+
+export interface UseXAccountConnectionOptions {
+  /** Full callback URL for OAuth return (e.g. settings page). */
+  callbackUrl?: string;
+  /** When false, skips loading X status (e.g. not yet authenticated). */
+  enabled?: boolean;
+  /** When true, shows a one-time recoverable style-sync toast on Connected Accounts. */
+  showStyleSyncIssueToast?: boolean;
+  /** Fires once right after the X OAuth exchange completes successfully. */
+  onConnected?: () => void;
+}
+
+export function useXAccountConnection({
+  callbackUrl,
+  enabled = true,
+  showStyleSyncIssueToast: shouldShowStyleSyncIssueToast = false,
+  onConnected,
+}: UseXAccountConnectionOptions) {
+  const [{ code, state, error, error_description }, setOauthParams] =
+    useQueryStates({
+      code: parseAsString,
+      state: parseAsString,
+      error: parseAsString,
+      error_description: parseAsString,
+    });
+
+  const getXStatus = useAction(api.x.getTwitterConnectionStatus);
+  const getXConnectLink = useAction(api.x.getTwitterConnectLink);
+  const completeXConnection = useAction(api.x.completeTwitterConnection);
+  const disconnectTwitter = useAction(api.x.disconnectTwitter);
+  const getXStatusRef = useRef(getXStatus);
+  const onConnectedRef = useRef(onConnected);
+  const connectedAccountIdRef = useRef<string | undefined>(undefined);
+  const authExchangeKeyRef = useRef<string | null>(null);
+  const shownStyleSyncIssueKeyRef = useRef<string | null>(null);
+  const styleSyncRefreshTimeoutsRef = useRef<number[]>([]);
+
+  const statusQuery = useQueryWithStatus(
+    api.connectedAccounts.getConnectionSnapshot,
+    enabled ? { platform: "twitter" } : "skip"
+  );
+  const xStatus =
+    statusQuery.data?.platform === "twitter" ? statusQuery.data : null;
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [isMutating, setIsMutating] = useState(false);
+  // Keep the populated list visible during post-connect background rechecks.
+  const statusLoading = enabled && statusQuery.isPending;
+
+  useEffect(() => {
+    getXStatusRef.current = getXStatus;
+  }, [getXStatus]);
+
+  useEffect(() => {
+    onConnectedRef.current = onConnected;
+  }, [onConnected]);
+
+  useEffect(() => {
+    connectedAccountIdRef.current = xStatus?.connectedAccountId;
+  }, [xStatus?.connectedAccountId]);
+
+  const clearStyleSyncRefreshTimeouts = useCallback(() => {
+    for (const timeoutId of styleSyncRefreshTimeoutsRef.current) {
+      window.clearTimeout(timeoutId);
+    }
+    styleSyncRefreshTimeoutsRef.current = [];
+  }, []);
+
+  const clearOauthParams = useCallback(() => {
+    setOauthParams(
+      {
+        code: null,
+        state: null,
+        error: null,
+        error_description: null,
+      },
+      { history: "replace" }
+    );
+  }, [setOauthParams]);
+
+  const refreshStatus = useCallback(async () => {
+    if (!enabled) {
+      return;
+    }
+    try {
+      await getXStatusRef.current({});
+      setStatusError(null);
+    } catch (err) {
+      logger.warn("Failed to load X connection status:", err);
+      setStatusError(
+        err instanceof Error ? err.message : "Unable to load X/Twitter status."
+      );
+    }
+  }, [enabled]);
+
+  const schedulePostConnectStatusChecks = useCallback(() => {
+    if (!shouldShowStyleSyncIssueToast || typeof window === "undefined") {
+      return;
+    }
+
+    clearStyleSyncRefreshTimeouts();
+    for (const delayMs of [4_000, 12_000, 30_000]) {
+      const timeoutId = window.setTimeout(() => {
+        void refreshStatus();
+      }, delayMs);
+      styleSyncRefreshTimeoutsRef.current.push(timeoutId);
+    }
+  }, [
+    clearStyleSyncRefreshTimeouts,
+    refreshStatus,
+    shouldShowStyleSyncIssueToast,
+  ]);
+
+  useEffect(() => {
+    void refreshStatus();
+  }, [refreshStatus]);
+
+  useEffect(() => {
+    return () => {
+      clearStyleSyncRefreshTimeouts();
+    };
+  }, [clearStyleSyncRefreshTimeouts]);
+
+  useEffect(() => {
+    const issue = xStatus?.styleSyncIssue;
+    if (
+      !shouldShowStyleSyncIssueToast ||
+      xStatus?.status !== "connected" ||
+      !issue?.key ||
+      shownStyleSyncIssueKeyRef.current === issue.key
+    ) {
+      return;
+    }
+
+    shownStyleSyncIssueKeyRef.current = issue.key;
+    showStyleSyncIssueToast({
+      issue,
+      platform: "twitter",
+    });
+  }, [shouldShowStyleSyncIssueToast, xStatus]);
+
+  useEffect(() => {
+    if (!error && !(code && state)) {
+      return;
+    }
+
+    if (!enabled) return;
+
+    if (error) {
+      clearOauthParams();
+      toast.error("Unable to connect X/Twitter", {
+        description:
+          error_description ||
+          "X/Twitter authorization was cancelled or failed.",
+      });
+      void refreshStatus();
+      return;
+    }
+
+    if (!enabled) {
+      return;
+    }
+
+    const oauthCode = code;
+    const oauthState = state;
+    if (!oauthCode || !oauthState) {
+      return;
+    }
+
+    const exchangeKey = `${oauthCode}:${oauthState}`;
+    if (authExchangeKeyRef.current === exchangeKey) {
+      return;
+    }
+    authExchangeKeyRef.current = exchangeKey;
+
+    void (async () => {
+      const previousConnectedAccountId = connectedAccountIdRef.current;
+      try {
+        setIsMutating(true);
+        const nextStatus = await completeXConnection({
+          code: oauthCode,
+          state: oauthState,
+        });
+        if (previousConnectedAccountId !== nextStatus.connectedAccountId) {
+          try {
+            await clearXChatBrowserData();
+          } catch (cleanupError) {
+            logger.warn(
+              "Failed to clear XChat browser data after X account change:",
+              cleanupError
+            );
+          }
+        }
+        setStatusError(null);
+        toast.success("Connected X/Twitter account", {
+          description: "Your X/Twitter account is ready.",
+        });
+        schedulePostConnectStatusChecks();
+        onConnectedRef.current?.();
+      } catch (exchangeError) {
+        logger.error("Failed to finalize X connection:", exchangeError);
+        toast.error("Unable to connect X/Twitter", {
+          description:
+            exchangeError instanceof Error
+              ? exchangeError.message
+              : "Please try again.",
+        });
+      } finally {
+        clearOauthParams();
+        setIsMutating(false);
+      }
+    })();
+  }, [
+    clearOauthParams,
+    code,
+    completeXConnection,
+    enabled,
+    error,
+    error_description,
+    refreshStatus,
+    schedulePostConnectStatusChecks,
+    state,
+  ]);
+
+  const handleConnectX = useCallback(async () => {
+    try {
+      setIsMutating(true);
+      const returnTo =
+        callbackUrl ??
+        (typeof window !== "undefined"
+          ? `${window.location.origin}${window.location.pathname}`
+          : "");
+      if (!returnTo) {
+        throw new Error("Could not resolve OAuth callback URL.");
+      }
+      // Store where to redirect after OAuth completes
+      document.cookie = `x_oauth_return_to=${encodeURIComponent(returnTo)}; path=/; max-age=900; SameSite=Lax`;
+      const oauthCallbackUrl = `${window.location.origin}/api/x/callback`;
+      const { redirectUrl } = await getXConnectLink({
+        callbackUrl: oauthCallbackUrl,
+      });
+      if (!redirectUrl) {
+        throw new Error("X/Twitter authorization could not be started.");
+      }
+      window.location.href = redirectUrl;
+    } catch (err) {
+      logger.error("Failed to start X connect:", err);
+      toast.error("Unable to start X/Twitter connection", {
+        description: err instanceof Error ? err.message : "Please try again.",
+      });
+      setIsMutating(false);
+    }
+  }, [callbackUrl, getXConnectLink]);
+
+  const handleDisconnectX = useCallback(async () => {
+    try {
+      setIsMutating(true);
+      await disconnectTwitter({});
+      try {
+        await clearXChatBrowserData();
+      } catch (cleanupError) {
+        logger.warn(
+          "Failed to clear XChat browser data after X account disconnect:",
+          cleanupError
+        );
+      }
+      toast.success("Disconnected X/Twitter account");
+      await refreshStatus();
+    } catch (err) {
+      logger.error("Failed to disconnect X account:", err);
+      toast.error("Unable to disconnect X/Twitter", {
+        description: err instanceof Error ? err.message : "Please try again.",
+      });
+    } finally {
+      setIsMutating(false);
+    }
+  }, [disconnectTwitter, refreshStatus]);
+
+  return {
+    xStatus,
+    statusLoading,
+    statusError: statusError ?? statusQuery.error?.message ?? null,
+    isMutating,
+    refreshStatus,
+    handleConnectX,
+    handleDisconnectX,
+  };
+}

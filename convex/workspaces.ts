@@ -1,0 +1,2950 @@
+import { validateSyntheticProfileExamples } from "./lib/syntheticProfileCore";
+import { getWorkspaceIcpRefreshFingerprint } from "./lib/workspaceIcpSignalsCore";
+import { v } from "convex/values";
+import type { WorkflowId } from "@convex-dev/workflow";
+import {
+  updateWorkspaceArgsValidator,
+  updateWorkspaceSettingsArgsValidator,
+  getWorkspaceArgsValidator,
+  setDefaultWorkspaceArgsValidator,
+  workspaceUseCaseKeyValidator,
+  workspaceTargetingSpecValidator,
+  workspaceOnboardingIssueSourceValidator,
+  workspaceOnboardingIssueStatusCodeValidator,
+  workspaceAgentAutonomyModeValidator,
+  icpValidator,
+} from "./validators";
+import {
+  getCurrentUTCTimestamp,
+  normalizeTimeZoneIdentifier,
+  isValidTimeZoneIdentifier,
+} from "../shared/lib/utils/time/timeUtils";
+import { internal } from "./_generated/api";
+import type { Doc, Id } from "./_generated/dataModel";
+import type { ActionCtx, MutationCtx, QueryCtx } from "./_generated/server";
+import {
+  action,
+  internalAction,
+  internalMutation,
+  internalQuery,
+  mutation,
+  query,
+} from "./lib/functionBuilders";
+import {
+  getDefaultWorkspaceForUser,
+  getRawDefaultWorkspaceForUser,
+  getOwnedWorkspace,
+  getUserByIdentity,
+  requireOwnedWorkspace,
+  requireUser,
+} from "./lib/accessHelpers";
+import { assertValidWorkspaceName } from "./lib/workspaceNameHelpers";
+import { hasRequiredWorkspaceAgentData } from "./lib/workspaceSetup";
+import { isWorkspaceAutomationActive } from "./lib/workspaceSystem";
+import { getActiveSetupSessionForUser } from "./lib/setupSessionCore";
+
+/**
+ * Resumes may find their seed monitors drained (paused workspaces release
+ * them to stop SocialAPI billing). Schedule the resync so reply discovery
+ * re-arms for seeds whose monitors no longer exist remotely. Runs even while
+ * the autonomous-jobs brake is on: resuming is user-initiated.
+ */
+async function scheduleSeedMonitorResync(
+  ctx: Pick<ActionCtx, "scheduler">,
+  workspaceId: Id<"workspaces">
+): Promise<void> {
+  await ctx.scheduler.runAfter(
+    0,
+    internal.xConversationDiscovery.resyncWorkspaceSeedMonitorsInternal,
+    { workspaceId }
+  );
+}
+import {
+  hasAnyWorkspaceIcpSyntheticPosts,
+  listWorkspaceIcpSignalMissingIndices,
+} from "./lib/workspaceIcpSignalsCore";
+import { applyWorkspaceSettingsUpdateCore } from "./lib/workspaceSettingsCore";
+import {
+  DEFAULT_WORKSPACE_USE_CASE_KEY,
+  resolveWorkspaceUseCaseKey,
+  type WorkspaceUseCaseKey,
+} from "../shared/lib/workspaceUseCases";
+import { QUALIFICATION_THRESHOLD } from "../shared/lib/qualificationConstants";
+import { deleteWorkspaceCascade } from "./lib/deleteWorkspaceCascade";
+import {
+  doesSetupSessionReserveEntitlementSlot,
+  doesWorkspaceReserveEntitlementSlot,
+  getFirstAccessibleWorkspaceForUser,
+  isWorkspaceAccessibleForUser,
+  resolveNextEntitlementSlotForUser,
+} from "./lib/workspaceEntitlements";
+import { recordWorkspaceActivityWithDb } from "./lib/workspaceActivity";
+import {
+  bootstrapWorkspaceStyleProfilesForWorkspaceOnDb,
+  type WorkspaceStyleBootstrapResult,
+} from "./lib/workspaceStyleProfileCore";
+import {
+  deriveWorkspaceSystemStatus,
+  getWorkspaceDiscoveryState,
+  getWorkspaceFeatureStatuses,
+  isWorkspaceInactive,
+} from "./lib/workspaceSystem";
+import { INACTIVITY_PAUSE_AFTER_MS } from "../shared/lib/workspaceSystem";
+import { getWorkspaceStatsSnapshot } from "./workspaceStats";
+import { workflow } from "./lib/workflow";
+import {
+  preferredShellContextValidator,
+  shouldPreferWorkspaceContext,
+} from "./lib/preferredShellContext";
+import { logger } from "../shared/lib/logger";
+import {
+  formatQualifiedProspectLimitReachedMessage,
+  MAX_PROSPECTING_RECOVERY_ATTEMPTS,
+  PROSPECTING_RECOVERY_KILL_SWITCH_POLL_MS,
+} from "./lib/prospectingHelpers";
+import { areAutonomousJobsPaused } from "./lib/autonomousJobHelpers";
+import {
+  getDefaultWorkspaceAgentSettings,
+  getWorkspaceAgentSettingsRow,
+} from "./lib/workspaceAgentSettingsCore";
+import {
+  prepareWorkspacePlanStartRun,
+  scheduleWorkspacePlanStartRun,
+} from "./lib/workspacePlanStartCore";
+import { requestWorkspaceDeletion } from "./workflows/deleteWorkspace";
+import { buildRegeneratedWorkspaceTargetingPatch } from "./lib/workspaceTargetingUpdateCore";
+import { validateWorkspaceProfiles } from "./lib/workspaceProfileChangeCore";
+
+type WorkspaceDoc = Doc<"workspaces">;
+type WorkspaceStyleProfileDoc = Doc<"workspaceStyleProfiles">;
+type WorkspaceAccessCtx = Pick<QueryCtx, "db"> | Pick<MutationCtx, "db">;
+type WorkspaceWithResolvedUseCase = Omit<WorkspaceDoc, "useCaseKey"> & {
+  useCaseKey: WorkspaceUseCaseKey;
+  styleProfileStatus: WorkspaceStyleProfileDoc["status"];
+  styleProfileVersion: number;
+};
+const workspaceLogger = logger.withScope("Workspaces");
+
+async function scheduleBootstrapStyleBackfillsIfNeeded(
+  ctx: Pick<MutationCtx, "scheduler">,
+  args: {
+    userId: Id<"users">;
+    results: WorkspaceStyleBootstrapResult[];
+  }
+) {
+  for (const result of args.results) {
+    if (result.reason !== "insufficient_samples") {
+      continue;
+    }
+
+    if (result.platform === "twitter") {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.styleAnalysisActions.backfillUserTimeline,
+        {
+          userId: args.userId,
+        }
+      );
+      continue;
+    }
+
+    await ctx.scheduler.runAfter(
+      0,
+      internal.styleAnalysisActions.backfillLinkedInProfilePosts,
+      {
+        userId: args.userId,
+      }
+    );
+  }
+}
+
+async function getWorkspaceTwitterStyleProfile(
+  ctx: WorkspaceAccessCtx,
+  workspaceId: WorkspaceDoc["_id"]
+) {
+  return await ctx.db
+    .query("workspaceStyleProfiles")
+    .withIndex("by_workspace_platform", (q) =>
+      q.eq("workspaceId", workspaceId).eq("platform", "twitter")
+    )
+    .first();
+}
+
+async function withResolvedWorkspaceUseCase(
+  ctx: WorkspaceAccessCtx,
+  workspace: WorkspaceDoc
+): Promise<WorkspaceWithResolvedUseCase> {
+  const styleProfile = await getWorkspaceTwitterStyleProfile(
+    ctx,
+    workspace._id
+  );
+  return {
+    ...workspace,
+    useCaseKey: resolveWorkspaceUseCaseKey(workspace.useCaseKey),
+    styleProfileStatus: styleProfile?.status ?? "none",
+    styleProfileVersion: styleProfile?.version ?? 0,
+  };
+}
+
+function getResolvedFitScoreRange(workspace: WorkspaceDoc) {
+  return {
+    fitScoreMin: workspace.fitScoreMin ?? QUALIFICATION_THRESHOLD,
+    fitScoreMax: workspace.fitScoreMax ?? 100,
+  };
+}
+
+// ============================================================================
+// Workspace Setup Status Query (for frontend)
+// ============================================================================
+
+/**
+ * Gets the workspace setup status for the agent UI.
+ * Used to determine which conversation flow to show.
+ */
+export const getWorkspaceSetupStatus = query({
+  args: {
+    preferredContext: preferredShellContextValidator,
+  },
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return { status: "unauthenticated" as const };
+    }
+
+    const user = await getUserByIdentity(ctx, identity);
+    if (!user) {
+      return { status: "no_user" as const };
+    }
+
+    const [activeSession, workspace] = await Promise.all([
+      getActiveSetupSessionForUser(ctx.db, user._id),
+      getDefaultWorkspaceForUser(ctx, user._id),
+    ]);
+    const preferWorkspaceContext = shouldPreferWorkspaceContext(
+      args.preferredContext,
+      workspace
+    );
+
+    if (activeSession && !preferWorkspaceContext) {
+      const activeWorkspace =
+        (activeSession.targetWorkspaceId
+          ? await ctx.db.get(activeSession.targetWorkspaceId)
+          : null) ?? workspace;
+
+      return {
+        status: "setup_in_progress" as const,
+        session: {
+          id: activeSession._id,
+          threadId: activeSession.setupThreadId,
+          status: activeSession.status,
+        },
+        workspace: activeWorkspace
+          ? {
+              id: activeWorkspace._id,
+              name: activeWorkspace.name,
+              description: activeWorkspace.description,
+              hasDescription: (activeWorkspace.description ?? "").length > 0,
+              useCaseKey: resolveWorkspaceUseCaseKey(
+                activeWorkspace.useCaseKey
+              ),
+              reportingTimeZone: activeWorkspace.reportingTimeZone ?? null,
+              ...getResolvedFitScoreRange(activeWorkspace),
+            }
+          : null,
+      };
+    }
+
+    if (!workspace) {
+      return { status: "no_workspace" as const };
+    }
+
+    const hasRequiredSetupData = hasRequiredWorkspaceAgentData(workspace);
+
+    if (!hasRequiredSetupData) {
+      return {
+        status: "needs_icp" as const,
+        workspace: {
+          id: workspace._id,
+          name: workspace.name,
+          description: workspace.description,
+          hasDescription: (workspace.description ?? "").length > 0,
+          useCaseKey: resolveWorkspaceUseCaseKey(workspace.useCaseKey),
+          reportingTimeZone: workspace.reportingTimeZone ?? null,
+          ...getResolvedFitScoreRange(workspace),
+        },
+      };
+    }
+
+    return {
+      status: "complete" as const,
+      workspace: {
+        id: workspace._id,
+        name: workspace.name,
+        description: workspace.description,
+        useCaseKey: resolveWorkspaceUseCaseKey(workspace.useCaseKey),
+        reportingTimeZone: workspace.reportingTimeZone ?? null,
+        ...getResolvedFitScoreRange(workspace),
+      },
+    };
+  },
+});
+
+/**
+ * Gets the current user's default workspace
+ */
+export const getDefaultWorkspace = query({
+  args: {},
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return null;
+    }
+
+    const user = await getUserByIdentity(ctx, identity);
+    if (!user) {
+      return null;
+    }
+
+    const workspace = await getDefaultWorkspaceForUser(ctx, user._id);
+    return workspace
+      ? await withResolvedWorkspaceUseCase(ctx, workspace)
+      : null;
+  },
+});
+
+/**
+ * Gets all workspaces for the current user
+ */
+export const getUserWorkspaces = query({
+  args: {},
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return [];
+    }
+
+    const user = await getUserByIdentity(ctx, identity);
+    if (!user) {
+      return [];
+    }
+
+    // Get all workspaces for the user
+    const workspaces = await ctx.db
+      .query("workspaces")
+      .withIndex("by_user_id", (q) => q.eq("userId", user._id))
+      .order("desc")
+      .collect();
+
+    return await Promise.all(
+      workspaces
+        .filter((workspace) => !workspace.deletionWorkflowId)
+        .map((workspace) => withResolvedWorkspaceUseCase(ctx, workspace))
+    );
+  },
+});
+
+export const getUserWorkspacesInternal = internalQuery({
+  args: {
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args) => {
+    const workspaces = await ctx.db
+      .query("workspaces")
+      .withIndex("by_user_id", (q) => q.eq("userId", args.userId))
+      .order("desc")
+      .collect();
+
+    return await Promise.all(
+      workspaces
+        .filter((workspace) => !workspace.deletionWorkflowId)
+        .map((workspace) => withResolvedWorkspaceUseCase(ctx, workspace))
+    );
+  },
+});
+
+/**
+ * Reactive deletion state used by the global workspace-deletion toast.
+ * Completed deletions disappear from this list when the workspace row is
+ * removed, allowing the client to update the existing loading toast.
+ */
+export const getWorkspaceDeletions = query({
+  args: {},
+  returns: v.array(
+    v.object({
+      workspaceId: v.id("workspaces"),
+      workspaceName: v.string(),
+      status: v.union(v.literal("deleting"), v.literal("failed")),
+    })
+  ),
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return [];
+    }
+    const user = await getUserByIdentity(ctx, identity);
+    if (!user) {
+      return [];
+    }
+    const workspaces = await ctx.db
+      .query("workspaces")
+      .withIndex("by_user_id", (q) => q.eq("userId", user._id))
+      .take(25);
+    const deletingWorkspaces = workspaces.filter(
+      (workspace) => workspace.deletionWorkflowId
+    );
+
+    return await Promise.all(
+      deletingWorkspaces.map(async (workspace) => {
+        const workflowStatus = await workflow.status(
+          ctx,
+          workspace.deletionWorkflowId as WorkflowId
+        );
+        return {
+          workspaceId: workspace._id,
+          workspaceName: workspace.name,
+          status:
+            workflowStatus.type === "failed" ||
+            workflowStatus.type === "canceled" ||
+            workflowStatus.type === "completed"
+              ? ("failed" as const)
+              : ("deleting" as const),
+        };
+      })
+    );
+  },
+});
+
+export const getWorkspaceAgentSettings = query({
+  args: { workspaceId: v.id("workspaces") },
+  handler: async (ctx, { workspaceId }) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return null;
+    }
+
+    const user = await getUserByIdentity(ctx, identity);
+    if (!user) {
+      return null;
+    }
+
+    const workspace = await requireOwnedWorkspace(ctx, workspaceId, {
+      user,
+      notFoundMessage: "Workspace not found",
+      notAuthorizedMessage: "Not authorized to view this workspace",
+    });
+    const settings = await getWorkspaceAgentSettingsRow(ctx, workspaceId);
+    return settings ?? getDefaultWorkspaceAgentSettings(workspace);
+  },
+});
+
+export const getWorkspaceAgentSettingsInternal = internalQuery({
+  args: { workspaceId: v.id("workspaces") },
+  handler: async (ctx, { workspaceId }) => {
+    const workspace = await ctx.db.get(workspaceId);
+    if (!workspace) {
+      return null;
+    }
+
+    const settings = await getWorkspaceAgentSettingsRow(ctx, workspaceId);
+    return settings ?? getDefaultWorkspaceAgentSettings(workspace);
+  },
+});
+
+/**
+ * Full workspace inspection for the △ Agent (internal).
+ * One call returns description, ICPs, connected accounts, and autonomy
+ * settings so the agent can ground its strategy in real workspace state.
+ */
+export const getWorkspaceInspectionInternal = internalQuery({
+  args: { workspaceId: v.id("workspaces") },
+  handler: async (ctx, { workspaceId }) => {
+    const workspace = await ctx.db.get(workspaceId);
+    if (!workspace) {
+      return null;
+    }
+
+    const [settingsRow, xAccount, linkedinAccount, pendingProfileProposal] =
+      await Promise.all([
+        getWorkspaceAgentSettingsRow(ctx, workspaceId),
+        ctx.db
+          .query("xAccounts")
+          .withIndex("by_user", (q) => q.eq("userId", workspace.userId))
+          .first(),
+        ctx.db
+          .query("linkedinAccounts")
+          .withIndex("by_user", (q) => q.eq("userId", workspace.userId))
+          .first(),
+        ctx.db
+          .query("workspaceProfileChangeRequests")
+          .withIndex("by_workspace_id_and_status", (q) =>
+            q.eq("workspaceId", workspaceId).eq("status", "pending_approval")
+          )
+          .unique(),
+      ]);
+    const settings = settingsRow ?? getDefaultWorkspaceAgentSettings(workspace);
+
+    return {
+      name: workspace.name,
+      description: workspace.improvedDescription || workspace.description,
+      useCaseKey: workspace.useCaseKey ?? null,
+      icps: (workspace.icps ?? []).map((icp) => ({
+        title: icp.title,
+        description: icp.description,
+        painPoints: icp.painPoints,
+        channels: icp.channels,
+      })),
+      pendingIdealProfileProposal: pendingProfileProposal
+        ? {
+            requestId: pendingProfileProposal._id,
+            revision: pendingProfileProposal.revision,
+            profiles: pendingProfileProposal.proposedIcps.map((profile) => ({
+              title: profile.title,
+              description: profile.description,
+              painPoints: profile.painPoints,
+              channels: profile.channels,
+            })),
+            addedTitles: pendingProfileProposal.addedTitles,
+            updatedTitles: pendingProfileProposal.updatedTitles,
+            removedTitles: pendingProfileProposal.removedTitles,
+          }
+        : null,
+      connectedAccounts: {
+        x: xAccount
+          ? {
+              username: xAccount.username,
+              status: xAccount.status,
+              subscriptionType: xAccount.xSubscriptionType ?? null,
+            }
+          : null,
+        linkedin: linkedinAccount
+          ? {
+              username:
+                linkedinAccount.username ??
+                linkedinAccount.publicIdentifier ??
+                null,
+              status: linkedinAccount.status,
+              premium: linkedinAccount.premium ?? false,
+            }
+          : null,
+      },
+      agentSettings: {
+        autonomyMode: settings.autonomyMode,
+      },
+    };
+  },
+});
+
+/**
+ * Live operational workspace snapshot for the main △ Agent.
+ *
+ * This deliberately reads the same maintained workspaceStats record used by
+ * the product UI. Agent answers about mutable workspace state must come from
+ * this source instead of being inferred from plans or conversation history.
+ */
+export const getWorkspaceOperationalSnapshotInternal = internalQuery({
+  args: { workspaceId: v.id("workspaces") },
+  handler: async (ctx, { workspaceId }) => {
+    const workspace = await ctx.db.get(workspaceId);
+    if (!workspace) {
+      return null;
+    }
+
+    const [stats, settingsRow, discoveryState, featureStatuses] =
+      await Promise.all([
+        getWorkspaceStatsSnapshot({ db: ctx.db, workspace }),
+        getWorkspaceAgentSettingsRow(ctx, workspaceId),
+        getWorkspaceDiscoveryState(ctx.db, workspace),
+        getWorkspaceFeatureStatuses(ctx.db, workspace),
+      ]);
+    const settings = settingsRow ?? getDefaultWorkspaceAgentSettings(workspace);
+    const systemStatus = deriveWorkspaceSystemStatus(workspace, {
+      discoveryState,
+      featureStatuses,
+    });
+
+    return {
+      workspace: {
+        name: workspace.name,
+        useCaseKey: workspace.useCaseKey ? String(workspace.useCaseKey) : null,
+      },
+      prospects: {
+        total: stats.totalProspectsCount,
+        qualified: stats.qualifiedProspectsCount,
+        enriched: stats.enrichedProspectsCount,
+        readyQualifiedEnriched: stats.readyQualifiedEnrichedCount,
+        actionableReady: stats.actionableReadyCount,
+        averageQualificationScore: stats.avgQualificationScore,
+        byStatus: {
+          new: stats.newProspectsCount,
+          contacted: stats.contactedProspectsCount,
+          inProgress: stats.inProgressProspectsCount,
+          converted: stats.convertedProspectsCount,
+          archived: stats.archivedProspectsCount,
+        },
+        byPlatform: {
+          twitter: stats.twitterProspectsCount,
+          linkedin: stats.linkedInProspectsCount,
+        },
+      },
+      outreach: {
+        plansGenerated: stats.plansGeneratedCount,
+      },
+      notifications: {
+        pending: stats.pendingNotificationCount,
+      },
+      agent: {
+        autonomyMode: settings.autonomyMode,
+        workflowStatus: workspace.prospectingWorkflowStatus ?? "stopped",
+        systemMode: systemStatus.mode,
+        pauseReason: systemStatus.pauseReason,
+        issueReason: systemStatus.issueReason,
+        canResume: systemStatus.canResume,
+      },
+      sourceUpdatedAt: stats.updatedAt,
+      queriedAt: getCurrentUTCTimestamp(),
+    };
+  },
+});
+
+/**
+ * Updates a workspace
+ */
+export const updateWorkspace = mutation({
+  args: updateWorkspaceArgsValidator,
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    await requireOwnedWorkspace(ctx, args.workspaceId, {
+      user,
+      notFoundMessage: "Workspace not found",
+      notAuthorizedMessage: "Not authorized to update this workspace",
+    });
+
+    // Update the workspace
+    const updateData: {
+      updatedAt: number;
+      name?: string;
+      description?: string;
+      descriptionSource?: "manual" | "url";
+      sourceUrl?: string;
+      lastGeneratedAt?: number;
+    } = {
+      updatedAt: getCurrentUTCTimestamp(),
+    };
+
+    if (args.name !== undefined) {
+      updateData.name = assertValidWorkspaceName(args.name);
+    }
+
+    if (args.description !== undefined)
+      updateData.description = args.description;
+    if (args.descriptionSource !== undefined)
+      updateData.descriptionSource = args.descriptionSource;
+    if (args.sourceUrl !== undefined) updateData.sourceUrl = args.sourceUrl;
+    if (args.lastGeneratedAt !== undefined)
+      updateData.lastGeneratedAt = args.lastGeneratedAt;
+
+    await ctx.db.patch(args.workspaceId, updateData);
+    return args.workspaceId;
+  },
+});
+
+/**
+ * Combined workspace settings update (Workspace page: Details + Profiles).
+ */
+export const updateWorkspaceSettings = mutation({
+  args: updateWorkspaceSettingsArgsValidator,
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    const workspace = await requireOwnedWorkspace(ctx, args.workspaceId, {
+      user,
+      notFoundMessage: "Workspace not found",
+      notAuthorizedMessage: "Not authorized to update this workspace",
+    });
+
+    const updates = {
+      name: args.name,
+      description: args.description,
+      seedDescription: args.seedDescription,
+      improvedDescription: args.improvedDescription,
+      icps: args.icps,
+      useCaseKey:
+        args.useCaseKey === undefined
+          ? undefined
+          : resolveWorkspaceUseCaseKey(args.useCaseKey),
+      sourceUrl: args.sourceUrl,
+      descriptionSource: args.descriptionSource,
+      lastGeneratedAt: args.lastGeneratedAt,
+      reportingTimeZone: args.reportingTimeZone,
+    };
+    return applyWorkspaceSettingsUpdateCore(ctx, { workspace, updates });
+  },
+});
+
+export const applyRegeneratedWorkspaceTargetingInternal = internalMutation({
+  args: {
+    expectedTargetingFingerprint: v.optional(v.string()),
+    workspaceId: v.id("workspaces"),
+    userId: v.id("users"),
+    name: v.string(),
+    sourceUrl: v.optional(v.string()),
+    rawUserDescription: v.string(),
+    improvedDescription: v.string(),
+    icps: v.array(icpValidator),
+    targetingSpec: workspaceTargetingSpecValidator,
+    useCaseKey: workspaceUseCaseKeyValidator,
+  },
+  returns: v.id("workspaces"),
+  handler: async (ctx, args) => {
+    const workspace = await ctx.db.get(args.workspaceId);
+    if (!workspace || workspace.userId !== args.userId) {
+      throw new Error("Workspace not found");
+    }
+
+    if (
+      args.expectedTargetingFingerprint !== undefined &&
+      args.expectedTargetingFingerprint !==
+        getWorkspaceIcpRefreshFingerprint(workspace)
+    )
+      throw new Error(
+        "Workspace targeting changed while regeneration was running; retry with current settings"
+      );
+    validateWorkspaceProfiles(args.icps);
+    const now = getCurrentUTCTimestamp();
+    await ctx.db.patch(args.workspaceId, {
+      ...buildRegeneratedWorkspaceTargetingPatch({
+        rawUserDescription: args.rawUserDescription,
+        improvedDescription: args.improvedDescription,
+        profiles: args.icps,
+        targetingSpec: args.targetingSpec,
+        useCaseKey: args.useCaseKey,
+        updatedAt: now,
+      }),
+      name: assertValidWorkspaceName(args.name),
+      ...(args.sourceUrl === undefined ? {} : { sourceUrl: args.sourceUrl }),
+    });
+
+    return args.workspaceId;
+  },
+});
+
+export const updateWorkspaceAgentSettings = mutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    autonomyMode: v.optional(workspaceAgentAutonomyModeValidator),
+    startExistingDraftPlans: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    const workspace = await requireOwnedWorkspace(ctx, args.workspaceId, {
+      user,
+      notFoundMessage: "Workspace not found",
+      notAuthorizedMessage: "Not authorized to update this workspace",
+    });
+
+    const existing = await getWorkspaceAgentSettingsRow(ctx, args.workspaceId);
+    const current = existing ?? getDefaultWorkspaceAgentSettings(workspace);
+    const now = getCurrentUTCTimestamp();
+    const nextSettings = {
+      ...current,
+      autonomyMode: args.autonomyMode ?? current.autonomyMode,
+      updatedAt: now,
+    };
+    const switchingToAutonomous =
+      current.autonomyMode !== "autonomous" &&
+      nextSettings.autonomyMode === "autonomous";
+    if (switchingToAutonomous && args.startExistingDraftPlans !== true) {
+      throw new Error(
+        "Confirm that existing draft plans may start before enabling autonomous sending."
+      );
+    }
+
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        autonomyMode: nextSettings.autonomyMode,
+        updatedAt: now,
+      });
+    } else {
+      await ctx.db.insert("workspaceAgentSettings", nextSettings);
+    }
+
+    let planStartRunId: Id<"workspacePlanStartRuns"> | null = null;
+    let draftPlanCount = 0;
+    let draftPlanCountIsCapped = false;
+    if (switchingToAutonomous) {
+      const prepared = await prepareWorkspacePlanStartRun(ctx, {
+        workspaceId: args.workspaceId,
+        userId: user._id,
+        source: "workspace_settings",
+        requireConfirmation: false,
+        createWhenNoDrafts: true,
+        autonomyMode: "autonomous",
+      });
+      planStartRunId = prepared.runId;
+      draftPlanCount = prepared.draftPlanCount;
+      draftPlanCountIsCapped = prepared.draftPlanCountIsCapped;
+      if (prepared.runId) {
+        await scheduleWorkspacePlanStartRun(ctx, prepared.runId, "autonomous");
+      }
+    }
+
+    return {
+      autonomyMode: nextSettings.autonomyMode,
+      planStartRunId,
+      draftPlanCount,
+      draftPlanCountIsCapped,
+    };
+  },
+});
+
+export const setWorkspaceReportingTimeZone = mutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    timeZone: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    const workspace = await requireOwnedWorkspace(ctx, args.workspaceId, {
+      user,
+      notFoundMessage: "Workspace not found",
+      notAuthorizedMessage: "Not authorized to update this workspace",
+    });
+
+    if (!isValidTimeZoneIdentifier(args.timeZone)) {
+      throw new Error("Invalid reporting timezone");
+    }
+
+    const reportingTimeZone = normalizeTimeZoneIdentifier(args.timeZone);
+    if (workspace.reportingTimeZone === reportingTimeZone) {
+      return reportingTimeZone;
+    }
+
+    await ctx.db.patch(workspace._id, {
+      reportingTimeZone,
+      updatedAt: getCurrentUTCTimestamp(),
+    });
+
+    return reportingTimeZone;
+  },
+});
+
+/**
+ * Permanently delete a workspace and all associated data. Switches default workspace when others exist.
+ */
+export const deleteWorkspace = mutation({
+  args: { workspaceId: v.id("workspaces") },
+  returns: v.object({
+    wasLastWorkspace: v.boolean(),
+    newDefaultWorkspaceId: v.optional(v.id("workspaces")),
+  }),
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    const workspace = await ctx.db.get("workspaces", args.workspaceId);
+    if (!workspace) throw new Error("Workspace not found");
+    if (workspace.userId !== user._id) {
+      throw new Error("Not authorized to update this workspace");
+    }
+    return await requestWorkspaceDeletion(ctx, workspace);
+  },
+});
+
+/**
+ * Sets the selected workspace as default for the current user.
+ * This drives active workspace context across the web app.
+ */
+export const setDefaultWorkspace = mutation({
+  args: setDefaultWorkspaceArgsValidator,
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    const targetWorkspace = await requireOwnedWorkspace(ctx, args.workspaceId, {
+      user,
+      notFoundMessage: "Workspace not found",
+      notAuthorizedMessage: "Not authorized to update this workspace",
+    });
+    if (!targetWorkspace.setupCompletedAt) {
+      throw new Error("Workspace setup is not complete");
+    }
+
+    if (targetWorkspace.isDefault) {
+      await recordWorkspaceActivityWithDb(ctx, targetWorkspace._id);
+      return { workspaceId: targetWorkspace._id, switched: false };
+    }
+
+    const now = getCurrentUTCTimestamp();
+    const currentDefaults = await ctx.db
+      .query("workspaces")
+      .withIndex("by_user_default", (q) =>
+        q.eq("userId", user._id).eq("isDefault", true)
+      )
+      .collect();
+
+    for (const workspace of currentDefaults) {
+      if (workspace._id !== targetWorkspace._id) {
+        await ctx.db.patch(workspace._id, {
+          isDefault: false,
+          updatedAt: now,
+        });
+      }
+    }
+
+    await ctx.db.patch(targetWorkspace._id, {
+      isDefault: true,
+      updatedAt: now,
+    });
+    await recordWorkspaceActivityWithDb(ctx, targetWorkspace._id, now);
+
+    return { workspaceId: targetWorkspace._id, switched: true };
+  },
+});
+
+export const recordWorkspaceActivity = mutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    await requireOwnedWorkspace(ctx, args.workspaceId, {
+      user,
+      notFoundMessage: "Workspace not found",
+      notAuthorizedMessage: "Not authorized to update this workspace",
+    });
+
+    return await recordWorkspaceActivityWithDb(ctx, args.workspaceId);
+  },
+});
+
+export const recordWorkspaceActivityInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    return await recordWorkspaceActivityWithDb(ctx, args.workspaceId);
+  },
+});
+
+export const listInactiveRunningWorkspacesInternal = internalQuery({
+  args: {
+    cutoff: v.number(),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("workspaces")
+      .withIndex("by_prospecting_status_last_activity", (q) =>
+        q
+          .eq("prospectingWorkflowStatus", "running")
+          .gt("lastMeaningfulActivityAt", undefined)
+          .lt("lastMeaningfulActivityAt", args.cutoff)
+      )
+      .collect();
+  },
+});
+
+/**
+ * Emergency stop for a workspace whose AI provider budget ran out. Retrying
+ * cannot succeed until credits are added, so autonomous discovery pauses with
+ * an explicit reason instead of burning failed requests. The agent status
+ * dialog surfaces the reason and its retry action resumes the workspace.
+ */
+export const pauseWorkspaceForAiCreditExhaustionInternal = internalAction({
+  args: { workspaceId: v.id("workspaces") },
+  returns: v.object({ paused: v.boolean() }),
+  handler: async (ctx, args) => {
+    const workspace = await ctx.runQuery(internal.workspaces.getById, {
+      workspaceId: args.workspaceId,
+    });
+    if (!workspace) return { paused: false };
+    if (
+      workspace.prospectingWorkflowStatus !== "running" &&
+      workspace.prospectingWorkflowStatus !== "stopped"
+    ) {
+      return { paused: false };
+    }
+
+    const now = getCurrentUTCTimestamp();
+    if (workspace.prospectingWorkflowId) {
+      try {
+        await workflow.cancel(ctx, workspace.prospectingWorkflowId as any);
+      } catch (error) {
+        workspaceLogger.warn(
+          "Failed to cancel prospecting workflow for AI credit exhaustion",
+          { workspaceId: String(args.workspaceId) },
+          error
+        );
+      }
+    }
+
+    await ctx.runMutation(internal.workflows.prospecting.updateWorkflowStatus, {
+      workspaceId: args.workspaceId,
+      status: "paused",
+      pauseReason: "ai_credits_exhausted",
+      pausedAt: now,
+    });
+    await ctx.runMutation(internal.tenantScheduler.pauseWorkspaceInternal, {
+      workspaceId: args.workspaceId,
+    });
+    workspaceLogger.warn("Workspace paused: AI credits exhausted", {
+      workspaceId: String(args.workspaceId),
+    });
+    return { paused: true };
+  },
+});
+
+export const pauseInactiveWorkspaces = internalAction({
+  args: {},
+  handler: async (ctx) => {
+    const now = getCurrentUTCTimestamp();
+    const cutoff = now - INACTIVITY_PAUSE_AFTER_MS;
+    const candidates = await ctx.runQuery(
+      internal.workspaces.listInactiveRunningWorkspacesInternal,
+      { cutoff }
+    );
+
+    let pausedCount = 0;
+
+    for (const workspace of candidates) {
+      if (workspace.prospectingWorkflowStatus !== "running") {
+        continue;
+      }
+
+      if (workspace.prospectingWorkflowId) {
+        try {
+          await workflow.cancel(ctx, workspace.prospectingWorkflowId as any);
+        } catch (error) {
+          workspaceLogger.warn(
+            "Failed to cancel inactive workspace workflow",
+            { workspaceId: String(workspace._id) },
+            error
+          );
+        }
+      }
+
+      await ctx.runMutation(
+        internal.workflows.prospecting.updateWorkflowStatus,
+        {
+          workspaceId: workspace._id,
+          status: "paused",
+          pauseReason: "inactive",
+          pausedAt: now,
+        }
+      );
+      // Pause the workspace's tenant lane too, so queued background jobs
+      // wait with the workspace instead of dispatching on a paused lane.
+      await ctx.runMutation(internal.tenantScheduler.pauseWorkspaceInternal, {
+        workspaceId: workspace._id,
+      });
+      pausedCount += 1;
+    }
+
+    return { pausedCount };
+  },
+});
+
+export const reconcileWorkspaceCapacityStateInternal = internalAction({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    const workspace = await ctx.runQuery(internal.workspaces.getById, {
+      workspaceId: args.workspaceId,
+    });
+
+    if (!workspace) {
+      return { ok: false as const, reason: "workspace_not_found" };
+    }
+
+    const limitState = await ctx.runQuery(
+      internal.workflows.prospecting.checkProspectLimitInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+    const capacityBlocked = limitState.limitReached;
+
+    if (capacityBlocked) {
+      if (workspace.prospectingWorkflowStatus === "running") {
+        if (workspace.prospectingWorkflowId) {
+          try {
+            await workflow.cancel(ctx, workspace.prospectingWorkflowId as any);
+          } catch (error) {
+            workspaceLogger.warn(
+              "Failed to cancel prospecting workflow during capacity reconcile",
+              { workspaceId: String(workspace._id) },
+              error
+            );
+          }
+        }
+
+        await ctx.runMutation(
+          internal.workflows.prospecting.updateWorkflowStatus,
+          {
+            workspaceId: args.workspaceId,
+            status: "limit_reached",
+            limitCycleStart: limitState.cycleStart,
+          }
+        );
+      } else if (
+        workspace.prospectingWorkflowStatus !== "limit_reached" ||
+        workspace.prospectingLimitCycleStart === undefined
+      ) {
+        // Re-writing the status also backfills the cycle window for
+        // workspaces that hit the limit before cycle tracking existed, so
+        // they can auto-resume on their next genuine renewal.
+        await ctx.runMutation(
+          internal.workflows.prospecting.updateWorkflowStatus,
+          {
+            workspaceId: args.workspaceId,
+            status: "limit_reached",
+            limitCycleStart: limitState.cycleStart,
+          }
+        );
+      }
+
+      await ctx.runMutation(
+        internal.socialapiMonitors.pauseWorkspaceMonitorsInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+
+      // Pause the workspace's tenant lane too, so queued background jobs
+      // wait with the workspace instead of dispatching on a plan-limited
+      // lane. The plan-batch reroute inside keeps manual plan work running.
+      await ctx.runMutation(internal.tenantScheduler.pauseWorkspaceInternal, {
+        workspaceId: args.workspaceId,
+      });
+
+      const prospects = await ctx.runQuery(
+        internal.prospects.listWorkspaceCapacityCandidatesInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+
+      for (const prospect of prospects) {
+        const isPendingQualification =
+          prospect.qualificationStatus !== "qualified" &&
+          prospect.qualificationStatus !== "disqualified";
+        const needsEnrichment =
+          prospect.status !== "archived" &&
+          prospect.qualificationStatus === "qualified" &&
+          prospect.enrichmentStatus !== "enriched";
+
+        if (isPendingQualification && prospect.qualificationWorkflowId) {
+          try {
+            await workflow.cancel(ctx, prospect.qualificationWorkflowId as any);
+          } catch (error) {
+            workspaceLogger.warn(
+              "Failed to cancel qualification workflow during capacity reconcile",
+              {
+                prospectId: String(prospect._id),
+                workspaceId: String(args.workspaceId),
+              },
+              error
+            );
+          }
+          await ctx.runMutation(
+            internal.prospects.clearQualificationWorkflowId,
+            {
+              prospectId: prospect._id,
+            }
+          );
+        }
+
+        if (needsEnrichment && prospect.enrichmentWorkflowId) {
+          try {
+            await workflow.cancel(ctx, prospect.enrichmentWorkflowId as any);
+            await ctx.runMutation(
+              internal.prospects.replaceEnrichmentWorkflowIdIfMatchesInternal,
+              {
+                prospectId: prospect._id,
+                expectedWorkflowId: prospect.enrichmentWorkflowId,
+              }
+            );
+          } catch (error) {
+            console.warn("[WorkspaceCapacity] Could not cancel enrichment", {
+              prospectId: prospect._id,
+              error,
+            });
+          }
+        }
+      }
+
+      await ctx.runMutation(
+        internal.workspaces.clearOnboardingIssueStateForSourceInternal,
+        {
+          workspaceId: args.workspaceId,
+          source: "workflow",
+        }
+      );
+      await ctx.runMutation(
+        internal.workspaces.clearProspectingRecoveryStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+
+      return {
+        ok: true as const,
+        capacityBlocked: true,
+        pausedWorkflowStatus: "limit_reached" as const,
+      };
+    }
+
+    await ctx.runMutation(
+      internal.socialapiMonitors.resumeWorkspaceMonitorsInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+    // Only running workspaces consume seed monitor webhooks. Workspaces that
+    // stay dormant here get their monitors recreated when they actually
+    // resume; resyncing them now would create monitors the hourly drain
+    // deletes again.
+    if (isWorkspaceAutomationActive(workspace)) {
+      await scheduleSeedMonitorResync(ctx, args.workspaceId);
+    }
+
+    if (
+      workspace.prospectingWorkflowStatus === "limit_reached" &&
+      hasRequiredWorkspaceAgentData(workspace) &&
+      // Capacity freed by mid-cycle disqualifications must not restart
+      // discovery. Resume only when a NEW usage cycle window began (plan
+      // renewal or complimentary grant replacement). Workspaces limited
+      // before cycle tracking exist stay paused until a new limit event
+      // records their cycle or a user resumes manually.
+      typeof workspace.prospectingLimitCycleStart === "number" &&
+      workspace.prospectingLimitCycleStart !== limitState.cycleStart
+    ) {
+      await ctx.runAction(
+        internal.workspaces.startProspectingWorkflowInternal,
+        {
+          workspaceId: args.workspaceId,
+          // An automatic capacity restart is not a user-initiated retry: it
+          // must not clear qualification retry budgets.
+          resetRecoveryAttempts: false,
+        }
+      );
+    }
+
+    const prospects = await ctx.runQuery(
+      internal.prospects.listWorkspaceCapacityRestartCandidatesInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+
+    for (const prospect of prospects) {
+      if (
+        prospect.qualificationStatus !== "qualified" &&
+        prospect.qualificationStatus !== "disqualified"
+      ) {
+        await ctx.runAction(
+          internal.workflows.qualification.startQualification,
+          {
+            prospectId: prospect._id,
+            workspaceId: args.workspaceId,
+          }
+        );
+        continue;
+      }
+
+      if (
+        prospect.qualificationStatus === "qualified" &&
+        prospect.enrichmentStatus !== "enriched"
+      ) {
+        await ctx.runAction(internal.workflows.enrichment.startEnrichment, {
+          prospectId: prospect._id,
+          workspaceId: args.workspaceId,
+        });
+      }
+    }
+
+    if (workspace.userId) {
+      await ctx
+        .runAction(
+          internal.outreachActions.enqueueEligibleAutoPlansForWorkspace,
+          {
+            workspaceId: args.workspaceId,
+            userId: workspace.userId,
+          }
+        )
+        .catch((error) => {
+          workspaceLogger.warn(
+            "Failed to enqueue auto plans after capacity resume",
+            { workspaceId: String(args.workspaceId) },
+            error
+          );
+        });
+    }
+
+    return { ok: true as const, capacityBlocked: false };
+  },
+});
+
+/**
+ * Ensures a user has a default workspace assignment without creating a new one.
+ * This is only for recovering users with existing workspaces but no default flag.
+ */
+export const ensureDefaultWorkspace = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    const existingDefault = await getDefaultWorkspaceForUser(ctx, user._id);
+
+    if (existingDefault) {
+      return existingDefault._id;
+    }
+
+    // If user has workspaces but none marked default, recover by promoting one.
+    const existingWorkspace = await ctx.db
+      .query("workspaces")
+      .withIndex("by_user_id", (q) => q.eq("userId", user._id))
+      .first();
+
+    if (existingWorkspace) {
+      await ctx.db.patch(existingWorkspace._id, {
+        isDefault: true,
+        updatedAt: getCurrentUTCTimestamp(),
+      });
+      return existingWorkspace._id;
+    }
+
+    return null;
+  },
+});
+
+/**
+ * One-time, idempotent rollout backfill for legacy workspaces created before
+ * `useCaseKey` was persisted. Existing rows keep their current template.
+ */
+export const backfillWorkspaceUseCases = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    const workspaces = await ctx.db
+      .query("workspaces")
+      .withIndex("by_user_id", (q) => q.eq("userId", user._id))
+      .collect();
+
+    let updated = 0;
+    let alreadyPersisted = 0;
+
+    for (const workspace of workspaces) {
+      if (workspace.useCaseKey !== undefined) {
+        alreadyPersisted += 1;
+        continue;
+      }
+
+      await ctx.db.patch(workspace._id, {
+        useCaseKey: DEFAULT_WORKSPACE_USE_CASE_KEY,
+        updatedAt: getCurrentUTCTimestamp(),
+      });
+      updated += 1;
+    }
+
+    return {
+      scanned: workspaces.length,
+      updated,
+      alreadyPersisted,
+      persistedUseCaseKey: DEFAULT_WORKSPACE_USE_CASE_KEY,
+    };
+  },
+});
+
+/**
+ * Gets a specific workspace by ID
+ */
+export const getWorkspace = query({
+  args: getWorkspaceArgsValidator,
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return null;
+    }
+
+    const user = await getUserByIdentity(ctx, identity);
+    if (!user) {
+      return null;
+    }
+
+    const workspace = await getOwnedWorkspace(ctx, args.workspaceId, user._id);
+    return workspace
+      ? await withResolvedWorkspaceUseCase(ctx, workspace)
+      : null;
+  },
+});
+
+// ============================================================================
+// Agent-specific mutations (Internal - no auth check)
+// ============================================================================
+
+/**
+ * Internal query to get workspace by ID (for agent actions).
+ * No auth check - used by trusted server-side code.
+ */
+export const getById = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    const workspace = await ctx.db.get(args.workspaceId);
+    return workspace
+      ? await withResolvedWorkspaceUseCase(ctx, workspace)
+      : null;
+  },
+});
+
+/**
+ * Internal query to get default workspace by user ID (for createWorkspace tool).
+ * Used to check if we should update existing or create new.
+ */
+export const getDefaultWorkspaceByUserId = internalQuery({
+  args: {
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args) => {
+    const workspace = await ctx.db
+      .query("workspaces")
+      .withIndex("by_user_default", (q) =>
+        q.eq("userId", args.userId).eq("isDefault", true)
+      )
+      .first();
+    return workspace
+      ? await withResolvedWorkspaceUseCase(ctx, workspace)
+      : null;
+  },
+});
+
+/**
+ * Internal query to get workspace by ID (alias for socialapiMonitors).
+ * Returns workspace with userId for creating monitors.
+ */
+export const getWorkspaceInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    const workspace = await ctx.db.get(args.workspaceId);
+    return workspace
+      ? await withResolvedWorkspaceUseCase(ctx, workspace)
+      : null;
+  },
+});
+
+export const getWorkspaceForTargetingUpdateInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args) => {
+    return await getOwnedWorkspace(ctx, args.workspaceId, args.userId);
+  },
+});
+
+/**
+ * Internal query to get default workspace for a user.
+ * Used by getUserStatus tool.
+ */
+export const getDefaultWorkspaceInternal = internalQuery({
+  args: {
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args) => {
+    const workspace = await ctx.db
+      .query("workspaces")
+      .withIndex("by_user_default", (q) =>
+        q.eq("userId", args.userId).eq("isDefault", true)
+      )
+      .first();
+    return workspace
+      ? await withResolvedWorkspaceUseCase(ctx, workspace)
+      : null;
+  },
+});
+
+/**
+ * Internal query to get the user's accessible default workspace.
+ * Safe for actions, which must cross into a query instead of reading `ctx.db`
+ * directly.
+ */
+export const getAccessibleDefaultWorkspaceInternal = internalQuery({
+  args: {
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args) => {
+    const workspace = await getDefaultWorkspaceForUser(ctx, args.userId);
+    return workspace
+      ? await withResolvedWorkspaceUseCase(ctx, workspace)
+      : null;
+  },
+});
+
+async function reconcileWorkspaceEntitlementsForUser(
+  ctx: MutationCtx,
+  userId: Id<"users">
+) {
+  const workspaces = await ctx.db
+    .query("workspaces")
+    .withIndex("by_user_id", (q) => q.eq("userId", userId))
+    .collect();
+  const sessions = await ctx.db
+    .query("workspaceSetupSessions")
+    .withIndex("by_user_last_active", (q) => q.eq("userId", userId))
+    .collect();
+  const now = getCurrentUTCTimestamp();
+
+  const reservingWorkspaces = workspaces
+    .filter(doesWorkspaceReserveEntitlementSlot)
+    .sort((a, b) => a._creationTime - b._creationTime);
+  let nextEntitlementSlot = 1;
+
+  for (const workspace of reservingWorkspaces) {
+    const entitlementSlot = nextEntitlementSlot;
+    nextEntitlementSlot += 1;
+    if (workspace.entitlementSlot === entitlementSlot) {
+      continue;
+    }
+    await ctx.db.patch(workspace._id, {
+      entitlementSlot,
+      updatedAt: now,
+    });
+  }
+
+  const reservingSetupSessions = sessions
+    .filter(doesSetupSessionReserveEntitlementSlot)
+    .sort((a, b) => a._creationTime - b._creationTime);
+
+  for (const session of reservingSetupSessions) {
+    const entitlementSlot = nextEntitlementSlot;
+    nextEntitlementSlot += 1;
+    if (session.entitlementSlot !== entitlementSlot) {
+      await ctx.db.patch(session._id, {
+        entitlementSlot,
+        lastActiveAt: session.lastActiveAt ?? now,
+      });
+    }
+    if (session.targetWorkspaceId && !session.existingWorkspaceId) {
+      const provisionedWorkspace = await ctx.db.get(session.targetWorkspaceId);
+      if (
+        provisionedWorkspace &&
+        provisionedWorkspace.userId === userId &&
+        !provisionedWorkspace.setupCompletedAt &&
+        provisionedWorkspace.entitlementSlot !== entitlementSlot
+      ) {
+        await ctx.db.patch(provisionedWorkspace._id, {
+          entitlementSlot,
+          updatedAt: now,
+        });
+      }
+    }
+  }
+
+  const rawDefaultWorkspace = await getRawDefaultWorkspaceForUser(ctx, userId);
+  const accessibleDefaultWorkspace = await getDefaultWorkspaceForUser(
+    ctx,
+    userId
+  );
+
+  if (
+    rawDefaultWorkspace &&
+    !(await isWorkspaceAccessibleForUser(ctx, rawDefaultWorkspace))
+  ) {
+    await ctx.db.patch(rawDefaultWorkspace._id, {
+      isDefault: false,
+      updatedAt: now,
+    });
+    if (
+      accessibleDefaultWorkspace &&
+      accessibleDefaultWorkspace._id !== rawDefaultWorkspace._id
+    ) {
+      await ctx.db.patch(accessibleDefaultWorkspace._id, {
+        isDefault: true,
+        updatedAt: now,
+      });
+    }
+  } else if (!rawDefaultWorkspace) {
+    const fallbackWorkspace = await getFirstAccessibleWorkspaceForUser(
+      ctx,
+      userId
+    );
+    if (fallbackWorkspace) {
+      await ctx.db.patch(fallbackWorkspace._id, {
+        isDefault: true,
+        updatedAt: now,
+      });
+    }
+  }
+}
+
+export const reconcileWorkspaceEntitlementsForUserInternal = internalMutation({
+  args: {
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args) => {
+    await reconcileWorkspaceEntitlementsForUser(ctx, args.userId);
+  },
+});
+
+export const cleanupDiscardedSetupProvisionalWorkspacesForUserInternal =
+  internalMutation({
+    args: {
+      userId: v.id("users"),
+      cursor: v.optional(v.string()),
+      batchSize: v.optional(v.number()),
+    },
+    handler: async (ctx, args) => {
+      const batchSize = Math.max(1, Math.min(25, args.batchSize ?? 10));
+      const page = await ctx.db
+        .query("workspaceSetupSessions")
+        .withIndex("by_user_status", (q) =>
+          q.eq("userId", args.userId).eq("status", "discarded")
+        )
+        .paginate({
+          cursor: args.cursor ?? null,
+          numItems: batchSize,
+        });
+
+      for (const session of page.page) {
+        if (session.mode !== "new_workspace" || !session.targetWorkspaceId) {
+          continue;
+        }
+        if (session.existingWorkspaceId) {
+          continue;
+        }
+
+        const workspace = await ctx.db.get(session.targetWorkspaceId);
+        if (
+          !workspace ||
+          workspace.userId !== args.userId ||
+          workspace.setupCompletedAt
+        ) {
+          continue;
+        }
+
+        await deleteWorkspaceCascade(ctx, workspace._id);
+        await reconcileWorkspaceEntitlementsForUser(ctx, args.userId);
+
+        if (!page.isDone) {
+          await ctx.scheduler.runAfter(
+            0,
+            internal.workspaces
+              .cleanupDiscardedSetupProvisionalWorkspacesForUserInternal,
+            {
+              userId: args.userId,
+              cursor: page.continueCursor,
+              batchSize,
+            }
+          );
+        }
+
+        return {
+          deletedCount: 1,
+          scheduled: !page.isDone,
+        };
+      }
+
+      await reconcileWorkspaceEntitlementsForUser(ctx, args.userId);
+
+      if (!page.isDone) {
+        await ctx.scheduler.runAfter(
+          0,
+          internal.workspaces
+            .cleanupDiscardedSetupProvisionalWorkspacesForUserInternal,
+          {
+            userId: args.userId,
+            cursor: page.continueCursor,
+            batchSize,
+          }
+        );
+      }
+
+      return {
+        deletedCount: 0,
+        scheduled: !page.isDone,
+      };
+    },
+  });
+
+/**
+ * Persist an internal onboarding issue state on a workspace.
+ * This is used for reliable, user-safe issue messaging.
+ */
+export const setOnboardingIssueStateInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    statusCode: workspaceOnboardingIssueStatusCodeValidator,
+    source: workspaceOnboardingIssueSourceValidator,
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.workspaceId, {
+      onboardingIssueStatusCode: args.statusCode,
+      onboardingIssueSource: args.source,
+      onboardingIssueUpdatedAt: getCurrentUTCTimestamp(),
+    });
+  },
+});
+
+/**
+ * Clear internal onboarding issue state once setup recovers.
+ */
+export const clearOnboardingIssueStateInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.workspaceId, {
+      onboardingIssueStatusCode: undefined,
+      onboardingIssueSource: undefined,
+      onboardingIssueUpdatedAt: undefined,
+    });
+  },
+});
+
+export const clearOnboardingIssueStateForSourceInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    source: workspaceOnboardingIssueSourceValidator,
+  },
+  handler: async (ctx, args) => {
+    const workspace = await ctx.db.get(args.workspaceId);
+    if (!workspace || workspace.onboardingIssueSource !== args.source) {
+      return { cleared: false as const };
+    }
+
+    await ctx.db.patch(args.workspaceId, {
+      onboardingIssueStatusCode: undefined,
+      onboardingIssueSource: undefined,
+      onboardingIssueUpdatedAt: undefined,
+    });
+
+    return { cleared: true as const };
+  },
+});
+
+export const clearProspectingRecoveryStateInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.workspaceId, {
+      prospectingFailureStreak: undefined,
+      prospectingNextRunAt: undefined,
+      prospectingNextRecoveryAt: undefined,
+      // prospectingRecoveryAttemptId is intentionally NOT reset: it is a
+      // monotonic token used to invalidate outstanding recovery timers. A
+      // reset could make an old episode's timer match a new episode's token
+      // and restart work before its backoff has elapsed. The failure-episode
+      // allowance is tracked by the failure streak instead.
+    });
+  },
+});
+
+/**
+ * Post-start recovery-state cleanup for startProspectingWorkflowInternal.
+ * User-initiated starts reset the whole failure episode; automatic recovery
+ * restarts only clear the fired timers so the attempt cap and growing
+ * backoff survive the restart.
+ */
+async function clearProspectingRecoveryStateForStart(
+  ctx: ActionCtx,
+  args: { workspaceId: Id<"workspaces">; resetRecoveryAttempts: boolean }
+): Promise<void> {
+  await ctx.runMutation(
+    args.resetRecoveryAttempts
+      ? internal.workspaces.clearProspectingRecoveryStateInternal
+      : internal.workspaces.clearProspectingRecoveryTimersInternal,
+    { workspaceId: args.workspaceId }
+  );
+  // Only a user-initiated start resets qualification retry budgets; automatic
+  // recovery restarts must leave retry caps and backoffs intact.
+  if (!args.resetRecoveryAttempts) return;
+  let cursor: string | undefined;
+  let guard = 0;
+  let hasMore = true;
+  while (hasMore && guard < 50) {
+    const page = await ctx.runMutation(
+      internal.prospects.resetQualificationFailureForWorkspaceInternal,
+      { workspaceId: args.workspaceId, cursor }
+    );
+    hasMore = page.hasMore;
+    cursor = page.continueCursor;
+    guard += 1;
+  }
+  if (hasMore) {
+    workspaceLogger.warn(
+      "Qualification failure reset stopped at page guard; rerun the start to continue",
+      { workspaceId: String(args.workspaceId) }
+    );
+  }
+}
+
+export const clearProspectingRecoveryTimersInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.workspaceId, {
+      prospectingNextRunAt: undefined,
+      prospectingNextRecoveryAt: undefined,
+    });
+  },
+});
+
+/**
+ * Persist setup thread linkage for a workspace so onboarding can restore context.
+ */
+export const setOnboardingThreadInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    threadId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.workspaceId, {
+      onboardingThreadId: args.threadId,
+      updatedAt: getCurrentUTCTimestamp(),
+    });
+  },
+});
+
+/**
+ * Internal mutation to create a workspace with v4 fields.
+ * Used by createWorkspace tool.
+ */
+export const createWorkspaceInternal = internalMutation({
+  args: {
+    userId: v.id("users"),
+    name: v.string(),
+    description: v.string(),
+    rawUserDescription: v.optional(v.string()),
+    seedDescription: v.string(),
+    improvedDescription: v.string(),
+    icps: v.array(icpValidator),
+    targetingSpec: v.optional(workspaceTargetingSpecValidator),
+    sourceUrl: v.optional(v.string()),
+    descriptionSource: v.union(v.literal("url"), v.literal("manual")),
+    useCaseKey: v.optional(workspaceUseCaseKeyValidator),
+    isDefault: v.boolean(),
+    entitlementSlot: v.optional(v.number()),
+    consumeReservedEntitlementSlot: v.optional(v.number()),
+    consumingSetupSessionId: v.optional(v.id("workspaceSetupSessions")),
+    fitScoreMin: v.optional(v.number()),
+    fitScoreMax: v.optional(v.number()),
+    setupCompletedAt: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const normalizedName = assertValidWorkspaceName(args.name);
+
+    const eligibility = await ctx.runQuery(
+      internal.plans.getWorkspaceCreationEligibilityByUserId,
+      {
+        userId: args.userId,
+        consumeEntitlementSlot: args.consumeReservedEntitlementSlot,
+        excludeSetupSessionId: args.consumingSetupSessionId,
+      }
+    );
+    if (!eligibility.allowed) {
+      throw new Error(eligibility.reason ?? "Workspace limit reached");
+    }
+
+    const now = getCurrentUTCTimestamp();
+    const entitlementSlot =
+      args.entitlementSlot ??
+      (await resolveNextEntitlementSlotForUser(ctx, args.userId));
+
+    // If setting as default, unset any existing default
+    if (args.isDefault) {
+      const existingDefault = await ctx.db
+        .query("workspaces")
+        .withIndex("by_user_default", (q) =>
+          q.eq("userId", args.userId).eq("isDefault", true)
+        )
+        .first();
+
+      if (existingDefault) {
+        await ctx.db.patch(existingDefault._id, { isDefault: false });
+      }
+    }
+
+    // Create new workspace with v4 fields
+    const workspaceId = await ctx.db.insert("workspaces", {
+      userId: args.userId,
+      name: normalizedName,
+      description: args.description,
+      rawUserDescription: args.rawUserDescription,
+      seedDescription: args.seedDescription,
+      improvedDescription: args.improvedDescription,
+      icps: args.icps,
+      targetingSpec: args.targetingSpec,
+      descriptionSource: args.descriptionSource,
+      sourceUrl: args.sourceUrl,
+      useCaseKey: args.useCaseKey,
+      lastGeneratedAt: now,
+      setupCompletedAt: args.setupCompletedAt,
+      fitScoreMin: args.fitScoreMin ?? QUALIFICATION_THRESHOLD,
+      fitScoreMax: args.fitScoreMax ?? 100,
+      isDefault: args.isDefault,
+      entitlementSlot,
+      updatedAt: now,
+    });
+
+    try {
+      const bootstrapResults =
+        await bootstrapWorkspaceStyleProfilesForWorkspaceOnDb(ctx, {
+          workspaceId,
+          userId: args.userId,
+        });
+      await scheduleBootstrapStyleBackfillsIfNeeded(ctx, {
+        userId: args.userId,
+        results: bootstrapResults,
+      });
+    } catch (error) {
+      workspaceLogger.warn(
+        "Failed to bootstrap style profiles for new workspace",
+        { workspaceId: String(workspaceId), userId: String(args.userId) },
+        error
+      );
+    }
+
+    return workspaceId;
+  },
+});
+
+/**
+ * Internal mutation to update a workspace with v4 fields.
+ * Used by updateWorkspace tool.
+ */
+export const updateWorkspaceInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    rawUserDescription: v.optional(v.string()),
+    seedDescription: v.optional(v.string()),
+    improvedDescription: v.string(),
+    description: v.string(),
+    icps: v.array(icpValidator),
+    targetingSpec: v.optional(workspaceTargetingSpecValidator),
+    sourceUrl: v.optional(v.string()),
+    descriptionSource: v.optional(
+      v.union(v.literal("url"), v.literal("manual"), v.literal("agent"))
+    ),
+    useCaseKey: v.optional(workspaceUseCaseKeyValidator),
+    setupCompletedAt: v.optional(v.number()),
+    isDefault: v.optional(v.boolean()),
+    fitScoreMin: v.optional(v.number()),
+    fitScoreMax: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const now = getCurrentUTCTimestamp();
+
+    const updateData: Record<string, unknown> = {
+      description: args.description,
+      improvedDescription: args.improvedDescription,
+      icps: args.icps,
+      lastGeneratedAt: now,
+      updatedAt: now,
+    };
+
+    if (args.targetingSpec !== undefined) {
+      updateData.targetingSpec = args.targetingSpec;
+    }
+
+    if (args.seedDescription !== undefined) {
+      updateData.seedDescription = args.seedDescription;
+    }
+    if (args.rawUserDescription !== undefined) {
+      updateData.rawUserDescription = args.rawUserDescription;
+    }
+    if (args.sourceUrl !== undefined) {
+      updateData.sourceUrl = args.sourceUrl;
+    }
+    if (args.descriptionSource !== undefined) {
+      updateData.descriptionSource = args.descriptionSource;
+    }
+    if (args.useCaseKey !== undefined) {
+      updateData.useCaseKey = args.useCaseKey;
+    }
+    if (args.setupCompletedAt !== undefined) {
+      updateData.setupCompletedAt = args.setupCompletedAt;
+    }
+    if (args.isDefault === true) {
+      const workspace = await ctx.db.get(args.workspaceId);
+      if (!workspace) {
+        throw new Error("Workspace not found");
+      }
+      const currentDefaults = await ctx.db
+        .query("workspaces")
+        .withIndex("by_user_default", (q) =>
+          q.eq("userId", workspace.userId).eq("isDefault", true)
+        )
+        .collect();
+
+      for (const currentDefault of currentDefaults) {
+        if (currentDefault._id !== args.workspaceId) {
+          await ctx.db.patch(currentDefault._id, {
+            isDefault: false,
+            updatedAt: now,
+          });
+        }
+      }
+
+      updateData.isDefault = true;
+    }
+    if (args.fitScoreMin !== undefined) {
+      updateData.fitScoreMin = args.fitScoreMin;
+    }
+    if (args.fitScoreMax !== undefined) {
+      updateData.fitScoreMax = args.fitScoreMax;
+    }
+
+    await ctx.db.patch(args.workspaceId, updateData);
+  },
+});
+
+export const updateWorkspaceIcpSignalsInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    icps: v.array(icpValidator),
+    targetingSpec: v.optional(workspaceTargetingSpecValidator),
+    expectedTargetingFingerprint: v.string(),
+    clearSystemIssue: v.optional(v.boolean()),
+    lastGeneratedAt: v.optional(v.number()),
+  },
+  handler: async (
+    ctx,
+    args
+  ): Promise<{
+    updated: boolean;
+    mayRestart: boolean;
+    publishedFingerprint?: string;
+  }> => {
+    const now = getCurrentUTCTimestamp();
+    const workspace = await ctx.db.get(args.workspaceId);
+
+    if (!workspace) {
+      throw new Error("Workspace not found");
+    }
+
+    if (
+      getWorkspaceIcpRefreshFingerprint(workspace) !==
+      args.expectedTargetingFingerprint
+    ) {
+      return { updated: false, mayRestart: false };
+    }
+
+    validateSyntheticProfileExamples(args.icps);
+    const updateData: Record<string, unknown> = {
+      icps: args.icps,
+      ...(args.targetingSpec ? { targetingSpec: args.targetingSpec } : {}),
+      updatedAt: now,
+      icpRefreshResumeRequested: undefined,
+    };
+
+    if (args.lastGeneratedAt !== undefined) {
+      updateData.lastGeneratedAt = args.lastGeneratedAt;
+    }
+
+    if (
+      args.clearSystemIssue &&
+      ((workspace.onboardingIssueSource === "system" &&
+        workspace.onboardingIssueStatusCode === "icp_refresh_required") ||
+        (workspace.onboardingIssueSource === "setup" &&
+          workspace.onboardingIssueStatusCode === "setup_incomplete"))
+    ) {
+      updateData.onboardingIssueStatusCode = undefined;
+      updateData.onboardingIssueSource = undefined;
+      updateData.onboardingIssueUpdatedAt = undefined;
+    }
+
+    await ctx.db.patch(args.workspaceId, updateData);
+    return {
+      updated: true,
+      publishedFingerprint: getWorkspaceIcpRefreshFingerprint(
+        (await ctx.db.get(args.workspaceId))!
+      ),
+      mayRestart:
+        workspace.prospectingWorkflowStatus === "stopped" ||
+        workspace.prospectingWorkflowStatus === "running",
+    };
+  },
+});
+
+// ============================================================================
+// Prospecting Workflow Management
+// ============================================================================
+
+type StartProspectingWorkflowOutcome =
+  | "started"
+  | "rearmed_running_workflow"
+  | "refreshing_icps"
+  | "limit_reached";
+
+type RecoverProspectingWorkflowOutcome =
+  | "restarted"
+  | "rearmed_running_workflow"
+  | "workspace_not_found"
+  | "stale_recovery"
+  | "status_changed"
+  | "issue_cleared"
+  | "inactive_paused"
+  | "refreshing_icps"
+  | "setup_incomplete"
+  | "limit_reached"
+  | "autonomous_jobs_paused"
+  | "recovery_exhausted";
+
+/**
+ * Start the continuous prospecting workflow for a workspace.
+ * Called automatically after workspace setup or manually by user.
+ */
+export const startProspectingWorkflow = action({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (
+    ctx,
+    args
+  ): Promise<{
+    success: boolean;
+    outcome: StartProspectingWorkflowOutcome;
+    error?: string;
+    workflowId?: string;
+  }> => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      throw new Error("Not authenticated");
+    }
+
+    const user = await ctx.runQuery(internal.users.getUserByWorkosIdInternal, {
+      workosUserId: identity.subject,
+    });
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const workspace = await ctx.runQuery(internal.workspaces.getById, {
+      workspaceId: args.workspaceId,
+    });
+
+    if (!workspace || workspace.userId !== user._id) {
+      throw new Error("Workspace not found");
+    }
+
+    const hasRequiredSetupData = hasRequiredWorkspaceAgentData(workspace);
+    if (!hasRequiredSetupData) {
+      throw new Error("Workspace setup is incomplete");
+    }
+    const limitState = await ctx.runQuery(
+      internal.workflows.prospecting.checkProspectLimitInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+    if (limitState.limitReached) {
+      await ctx.runAction(
+        internal.workspaces.reconcileWorkspaceCapacityStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      return {
+        success: false,
+        outcome: "limit_reached",
+        error: formatQualifiedProspectLimitReachedMessage({
+          currentCount: limitState.currentCount,
+          limit: limitState.limit,
+        }),
+      };
+    }
+
+    const missingSignalIndices = listWorkspaceIcpSignalMissingIndices(
+      workspace.icps ?? []
+    );
+    if (
+      workspace.onboardingIssueStatusCode === "icp_refresh_required" ||
+      (missingSignalIndices.length > 0 &&
+        !hasAnyWorkspaceIcpSyntheticPosts(workspace.icps ?? []))
+    ) {
+      await ctx.runMutation(
+        internal.workspaces.setOnboardingIssueStateInternal,
+        {
+          workspaceId: args.workspaceId,
+          statusCode: "icp_refresh_required",
+          source: "system",
+        }
+      );
+      const refreshResult = await ctx.runAction(
+        internal.workspaceIcpSignals.refreshWorkspaceIcpSignalsInternal,
+        {
+          workspaceId: args.workspaceId,
+          targetIndices: missingSignalIndices,
+          restartWorkflow: true,
+        }
+      );
+      if (
+        !refreshResult.success &&
+        refreshResult.refreshedIndices.length === 0 &&
+        refreshResult.restoredIndices.length === 0
+      ) {
+        return {
+          success: false,
+          outcome: "refreshing_icps",
+          error: "Could not refresh profile targeting. Please try again.",
+        };
+      }
+      return {
+        success: true,
+        outcome: "refreshing_icps",
+      };
+    }
+
+    const now = getCurrentUTCTimestamp();
+
+    // Check if workflow is already running
+    if (workspace.prospectingWorkflowStatus === "running") {
+      await ctx.runMutation(internal.tenantScheduler.resumeWorkspaceInternal, {
+        workspaceId: args.workspaceId,
+      });
+      await ctx.runMutation(
+        internal.socialapiMonitors.resumeWorkspaceMonitorsInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      await scheduleSeedMonitorResync(ctx, args.workspaceId);
+      await ctx.runMutation(
+        internal.workspaces.clearOnboardingIssueStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      await ctx.runMutation(
+        internal.workspaces.clearProspectingRecoveryStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      return {
+        success: true,
+        outcome: "rearmed_running_workflow",
+        workflowId: workspace.prospectingWorkflowId ?? undefined,
+      };
+    }
+
+    await ctx.runMutation(
+      internal.workflows.prospecting.initializeProspectingBootstrapInternal,
+      { workspaceId: args.workspaceId }
+    );
+
+    // Start the workflow with onComplete handler for continuous operation
+    const workflowId = await workflow.start(
+      ctx,
+      internal.workflows.prospecting.prospectingWorkflow,
+      { workspaceId: args.workspaceId },
+      {
+        onComplete: internal.workflows.prospecting.handleWorkflowComplete,
+        context: { workspaceId: args.workspaceId },
+      }
+    );
+
+    // Update workspace with workflow ID and status
+    await ctx.runMutation(internal.workflows.prospecting.updateWorkflowStatus, {
+      workspaceId: args.workspaceId,
+      status: "running",
+      workflowId: workflowId.toString(),
+      lastMeaningfulActivityAt: now,
+    });
+    await ctx.runMutation(internal.tenantScheduler.resumeWorkspaceInternal, {
+      workspaceId: args.workspaceId,
+    });
+    await ctx.runMutation(
+      internal.workspaces.clearOnboardingIssueStateInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+    await ctx.runMutation(
+      internal.socialapiMonitors.resumeWorkspaceMonitorsInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+    await scheduleSeedMonitorResync(ctx, args.workspaceId);
+    await ctx.runMutation(
+      internal.workspaces.clearProspectingRecoveryStateInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+
+    return {
+      success: true,
+      outcome: "started",
+      workflowId: workflowId.toString(),
+    };
+  },
+});
+
+/**
+ * Internal action to start workflow (for use by agent tools).
+ */
+export const startProspectingWorkflowInternal = internalAction({
+  args: {
+    workspaceId: v.id("workspaces"),
+    // Automatic recovery restarts must keep the recovery attempt counter and
+    // failure streak so the recovery cap and growing backoff hold across a
+    // fail-recover loop. User-initiated starts (the default) reset both.
+    resetRecoveryAttempts: v.optional(v.boolean()),
+  },
+  handler: async (
+    ctx,
+    args
+  ): Promise<{
+    success: boolean;
+    outcome: StartProspectingWorkflowOutcome;
+    error?: string;
+    workflowId?: string;
+  }> => {
+    // Get workspace to verify it exists and is ready
+    const workspace = await ctx.runQuery(internal.workspaces.getById, {
+      workspaceId: args.workspaceId,
+    });
+
+    if (!workspace) {
+      throw new Error("Workspace not found");
+    }
+
+    const hasRequiredSetupData = hasRequiredWorkspaceAgentData(workspace);
+    if (!hasRequiredSetupData) {
+      throw new Error("Workspace setup is incomplete");
+    }
+    const limitState = await ctx.runQuery(
+      internal.workflows.prospecting.checkProspectLimitInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+    if (limitState.limitReached) {
+      await ctx.runAction(
+        internal.workspaces.reconcileWorkspaceCapacityStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      return {
+        success: false,
+        outcome: "limit_reached",
+        error: formatQualifiedProspectLimitReachedMessage({
+          currentCount: limitState.currentCount,
+          limit: limitState.limit,
+        }),
+      };
+    }
+
+    const missingSignalIndices = listWorkspaceIcpSignalMissingIndices(
+      workspace.icps ?? []
+    );
+    if (
+      workspace.onboardingIssueStatusCode === "icp_refresh_required" ||
+      (missingSignalIndices.length > 0 &&
+        !hasAnyWorkspaceIcpSyntheticPosts(workspace.icps ?? []))
+    ) {
+      await ctx.runMutation(
+        internal.workspaces.setOnboardingIssueStateInternal,
+        {
+          workspaceId: args.workspaceId,
+          statusCode: "icp_refresh_required",
+          source: "system",
+        }
+      );
+      const refreshResult = await ctx.runAction(
+        internal.workspaceIcpSignals.refreshWorkspaceIcpSignalsInternal,
+        {
+          workspaceId: args.workspaceId,
+          targetIndices: missingSignalIndices,
+          restartWorkflow: true,
+        }
+      );
+      if (
+        !refreshResult.success &&
+        refreshResult.refreshedIndices.length === 0 &&
+        refreshResult.restoredIndices.length === 0
+      ) {
+        return {
+          success: false,
+          outcome: "refreshing_icps",
+          error: "Could not refresh profile targeting. Please try again.",
+        };
+      }
+      return {
+        success: true,
+        outcome: "refreshing_icps",
+      };
+    }
+
+    const now = getCurrentUTCTimestamp();
+
+    // Check if workflow is already running
+    if (workspace.prospectingWorkflowStatus === "running") {
+      await ctx.runMutation(internal.tenantScheduler.resumeWorkspaceInternal, {
+        workspaceId: args.workspaceId,
+      });
+      await ctx.runMutation(
+        internal.socialapiMonitors.resumeWorkspaceMonitorsInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      await scheduleSeedMonitorResync(ctx, args.workspaceId);
+      await ctx.runMutation(
+        internal.workspaces.clearOnboardingIssueStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      await clearProspectingRecoveryStateForStart(ctx, {
+        workspaceId: args.workspaceId,
+        resetRecoveryAttempts: args.resetRecoveryAttempts !== false,
+      });
+      return {
+        success: true,
+        outcome: "rearmed_running_workflow",
+        workflowId: workspace.prospectingWorkflowId ?? undefined,
+      };
+    }
+
+    await ctx.runMutation(
+      internal.workflows.prospecting.initializeProspectingBootstrapInternal,
+      { workspaceId: args.workspaceId }
+    );
+
+    // Start the workflow with onComplete handler for continuous operation
+    const workflowId = await workflow.start(
+      ctx,
+      internal.workflows.prospecting.prospectingWorkflow,
+      { workspaceId: args.workspaceId },
+      {
+        onComplete: internal.workflows.prospecting.handleWorkflowComplete,
+        context: { workspaceId: args.workspaceId },
+      }
+    );
+
+    // Update workspace with workflow ID and status
+    await ctx.runMutation(internal.workflows.prospecting.updateWorkflowStatus, {
+      workspaceId: args.workspaceId,
+      status: "running",
+      workflowId: workflowId.toString(),
+      lastMeaningfulActivityAt: now,
+    });
+    await ctx.runMutation(internal.tenantScheduler.resumeWorkspaceInternal, {
+      workspaceId: args.workspaceId,
+    });
+    await ctx.runMutation(
+      internal.workspaces.clearOnboardingIssueStateInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+    await ctx.runMutation(
+      internal.socialapiMonitors.resumeWorkspaceMonitorsInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+    await scheduleSeedMonitorResync(ctx, args.workspaceId);
+    await clearProspectingRecoveryStateForStart(ctx, {
+      workspaceId: args.workspaceId,
+      resetRecoveryAttempts: args.resetRecoveryAttempts !== false,
+    });
+
+    return {
+      success: true,
+      outcome: "started",
+      workflowId: workflowId.toString(),
+    };
+  },
+});
+
+export const restartProspectingWorkflowForSetupInternal = internalAction({
+  args: {
+    workspaceId: v.id("workspaces"),
+    expectedTargetingFingerprint: v.optional(v.string()),
+  },
+  handler: async (
+    ctx,
+    args
+  ): Promise<{ success: boolean; workflowId?: string; error?: string }> => {
+    const workspace = await ctx.runQuery(internal.workspaces.getById, {
+      workspaceId: args.workspaceId,
+    });
+
+    if (!workspace) {
+      throw new Error("Workspace not found");
+    }
+
+    const hasRequiredSetupData = hasRequiredWorkspaceAgentData(workspace);
+    if (!hasRequiredSetupData) {
+      throw new Error("Workspace setup is incomplete");
+    }
+    const limitState = await ctx.runQuery(
+      internal.workflows.prospecting.checkProspectLimitInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+    if (limitState.limitReached) {
+      await ctx.runAction(
+        internal.workspaces.reconcileWorkspaceCapacityStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      return {
+        success: false,
+        error: formatQualifiedProspectLimitReachedMessage({
+          currentCount: limitState.currentCount,
+          limit: limitState.limit,
+        }),
+      };
+    }
+
+    return ctx.runMutation(
+      internal.workspaces.restartProspectingWorkflowForSetupCommitInternal,
+      args
+    );
+  },
+});
+
+/** Commit the restart and targeting check in the same transaction. */
+export const restartProspectingWorkflowForSetupCommitInternal =
+  internalMutation({
+    args: {
+      workspaceId: v.id("workspaces"),
+      expectedTargetingFingerprint: v.optional(v.string()),
+    },
+    handler: async (
+      ctx,
+      args
+    ): Promise<{ success: boolean; workflowId?: string; error?: string }> => {
+      const workspace = await ctx.db.get(args.workspaceId);
+      if (!workspace || !hasRequiredWorkspaceAgentData(workspace)) {
+        throw new Error("Workspace setup is incomplete");
+      }
+      if (
+        args.expectedTargetingFingerprint !== undefined &&
+        (getWorkspaceIcpRefreshFingerprint(workspace) !==
+          args.expectedTargetingFingerprint ||
+          !["stopped", "running"].includes(
+            workspace.prospectingWorkflowStatus ?? ""
+          ) ||
+          listWorkspaceIcpSignalMissingIndices(workspace.icps).length > 0 ||
+          workspace.onboardingIssueStatusCode === "icp_refresh_required")
+      ) {
+        return {
+          success: false,
+          error: "Targeting changed or Agent was paused during refresh.",
+        };
+      }
+      const now = getCurrentUTCTimestamp();
+      if (workspace.prospectingWorkflowId) {
+        try {
+          await workflow.cancel(ctx, workspace.prospectingWorkflowId as any);
+        } catch (error) {
+          workspaceLogger.warn(
+            "Failed to cancel prior prospecting workflow during restart",
+            { workspaceId: String(args.workspaceId) },
+            error
+          );
+        }
+      }
+
+      await ctx.runMutation(
+        internal.workflows.prospecting.updateWorkflowStatus,
+        {
+          workspaceId: args.workspaceId,
+          status: "stopped",
+        }
+      );
+
+      await ctx.runMutation(
+        internal.workflows.prospecting.initializeProspectingBootstrapInternal,
+        { workspaceId: args.workspaceId }
+      );
+
+      const workflowId = await workflow.start(
+        ctx,
+        internal.workflows.prospecting.prospectingWorkflow,
+        { workspaceId: args.workspaceId },
+        {
+          onComplete: internal.workflows.prospecting.handleWorkflowComplete,
+          context: { workspaceId: args.workspaceId },
+        }
+      );
+
+      await ctx.runMutation(
+        internal.workflows.prospecting.updateWorkflowStatus,
+        {
+          workspaceId: args.workspaceId,
+          status: "running",
+          workflowId: workflowId.toString(),
+          lastMeaningfulActivityAt: now,
+        }
+      );
+      await ctx.runMutation(internal.tenantScheduler.resumeWorkspaceInternal, {
+        workspaceId: args.workspaceId,
+      });
+      await ctx.runMutation(
+        internal.workspaces.clearOnboardingIssueStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      await ctx.runMutation(
+        internal.socialapiMonitors.resumeWorkspaceMonitorsInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      await scheduleSeedMonitorResync(ctx, args.workspaceId);
+      await ctx.runMutation(
+        internal.workspaces.clearProspectingRecoveryStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+
+      return {
+        success: true,
+        workflowId: workflowId.toString(),
+      };
+    },
+  });
+
+/**
+ * Retry a failed prospecting workflow after cooldown.
+ * Only restarts true workflow failures, never manual pauses/stops.
+ */
+export const attemptProspectingWorkflowRecoveryInternal = internalAction({
+  args: {
+    workspaceId: v.id("workspaces"),
+    recoveryAttemptId: v.number(),
+  },
+  handler: async (
+    ctx,
+    args
+  ): Promise<{
+    success: boolean;
+    outcome: RecoverProspectingWorkflowOutcome;
+    error?: string;
+    workflowId?: string;
+  }> => {
+    const workspace = await ctx.runQuery(internal.workspaces.getById, {
+      workspaceId: args.workspaceId,
+    });
+
+    if (!workspace) {
+      return {
+        success: false,
+        outcome: "workspace_not_found",
+      };
+    }
+
+    if (workspace.prospectingRecoveryAttemptId !== args.recoveryAttemptId) {
+      return {
+        success: false,
+        outcome: "stale_recovery",
+      };
+    }
+
+    if (
+      workspace.onboardingIssueSource !== "workflow" ||
+      workspace.onboardingIssueStatusCode !== "workflow_failed"
+    ) {
+      return {
+        success: false,
+        outcome: "issue_cleared",
+      };
+    }
+
+    if (workspace.prospectingWorkflowStatus !== "stopped") {
+      return {
+        success: false,
+        outcome: "status_changed",
+      };
+    }
+
+    // Every automatic restart re-runs discovery and qualification and spends
+    // provider credits. A workspace stuck in a fail-recover loop (for example
+    // a persistently broken provider) must stop draining credits instead of
+    // retrying forever, so cap the attempts per failure episode and leave the
+    // workspace in its "needs attention" state for the user to retry. The
+    // failure streak persists across automatic restarts and only resets on a
+    // user-initiated start or a successful cycle. The cap is checked before
+    // the emergency brake so an exhausted episode reaches this cleanup even
+    // while PAUSE_AUTONOMOUS_JOBS is set, instead of re-arming the poll
+    // forever.
+    if (
+      (workspace.prospectingFailureStreak ?? 0) >
+      MAX_PROSPECTING_RECOVERY_ATTEMPTS
+    ) {
+      console.warn(
+        "[ProspectingRecovery] Recovery attempt cap reached; waiting for user retry",
+        {
+          workspaceId: String(args.workspaceId),
+          failureStreak: workspace.prospectingFailureStreak,
+          recoveryAttemptId: workspace.prospectingRecoveryAttemptId,
+          lastFailureAt: workspace.prospectingLastFailureAt
+            ? new Date(workspace.prospectingLastFailureAt).toISOString()
+            : null,
+        }
+      );
+      await ctx.runMutation(
+        internal.workspaces.clearProspectingRecoveryStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      return {
+        success: false,
+        outcome: "recovery_exhausted",
+      };
+    }
+
+    // Emergency brake: never restart autonomous discovery while
+    // PAUSE_AUTONOMOUS_JOBS is set. Re-arm the same recovery attempt on a
+    // short poll so lifting the brake resumes recovery automatically,
+    // without touching any workspace state.
+    if (areAutonomousJobsPaused()) {
+      await ctx.scheduler.runAfter(
+        PROSPECTING_RECOVERY_KILL_SWITCH_POLL_MS,
+        internal.workspaces.attemptProspectingWorkflowRecoveryInternal,
+        {
+          workspaceId: args.workspaceId,
+          recoveryAttemptId: args.recoveryAttemptId,
+        }
+      );
+      return {
+        success: false,
+        outcome: "autonomous_jobs_paused",
+      };
+    }
+
+    if (isWorkspaceInactive(workspace)) {
+      await ctx.runMutation(
+        internal.workflows.prospecting.updateWorkflowStatus,
+        {
+          workspaceId: args.workspaceId,
+          status: "paused",
+          pauseReason: "inactive",
+        }
+      );
+      await ctx.runMutation(
+        internal.workspaces.clearOnboardingIssueStateForSourceInternal,
+        {
+          workspaceId: args.workspaceId,
+          source: "workflow",
+        }
+      );
+      await ctx.runMutation(
+        internal.workspaces.clearProspectingRecoveryStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      return {
+        success: false,
+        outcome: "inactive_paused",
+      };
+    }
+
+    if (!hasRequiredWorkspaceAgentData(workspace)) {
+      await ctx.runMutation(
+        internal.workspaces.setOnboardingIssueStateInternal,
+        {
+          workspaceId: args.workspaceId,
+          statusCode: "setup_incomplete",
+          source: "setup",
+        }
+      );
+      await ctx.runMutation(
+        internal.workspaces.clearProspectingRecoveryStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      return {
+        success: false,
+        outcome: "setup_incomplete",
+      };
+    }
+
+    const result = await ctx.runAction(
+      internal.workspaces.startProspectingWorkflowInternal,
+      {
+        workspaceId: args.workspaceId,
+        resetRecoveryAttempts: false,
+      }
+    );
+
+    if (result.success) {
+      return {
+        success: true,
+        outcome:
+          result.outcome === "started"
+            ? "restarted"
+            : "rearmed_running_workflow",
+        workflowId: result.workflowId,
+      };
+    }
+
+    if (result.outcome === "limit_reached") {
+      await ctx.runMutation(
+        internal.workspaces.clearOnboardingIssueStateForSourceInternal,
+        {
+          workspaceId: args.workspaceId,
+          source: "workflow",
+        }
+      );
+      await ctx.runMutation(
+        internal.workspaces.clearProspectingRecoveryStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+      return {
+        success: false,
+        outcome: "limit_reached",
+        error: result.error,
+      };
+    }
+
+    return {
+      success: false,
+      outcome: "status_changed",
+      error: result.error,
+    };
+  },
+});
+
+/**
+ * Stop the continuous prospecting workflow for a workspace.
+ */
+export const stopProspectingWorkflow = action({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      throw new Error("Not authenticated");
+    }
+
+    const user = await ctx.runQuery(internal.users.getUserByWorkosIdInternal, {
+      workosUserId: identity.subject,
+    });
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const workspace = await ctx.runQuery(internal.workspaces.getById, {
+      workspaceId: args.workspaceId,
+    });
+
+    if (!workspace || workspace.userId !== user._id) {
+      throw new Error("Workspace not found");
+    }
+
+    await ctx.runMutation(internal.tenantScheduler.pauseWorkspaceInternal, {
+      workspaceId: args.workspaceId,
+    });
+
+    const pausedMonitors = await ctx.runMutation(
+      internal.socialapiMonitors.pauseWorkspaceMonitorsInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+
+    if (
+      !workspace.prospectingWorkflowId &&
+      pausedMonitors.pausedCount === 0 &&
+      workspace.prospectingWorkflowStatus !== "running"
+    ) {
+      return {
+        success: false,
+        error: "No active △ Agent activity found",
+      };
+    }
+
+    // Cancel the workflow
+    if (workspace.prospectingWorkflowId) {
+      try {
+        await workflow.cancel(ctx, workspace.prospectingWorkflowId as any);
+      } catch (err) {
+        workspaceLogger.error(
+          "Failed to cancel workflow",
+          { workspaceId: String(args.workspaceId) },
+          err
+        );
+        // Continue to update status even if cancel fails
+      }
+    }
+
+    // Update workspace status
+    await ctx.runMutation(internal.workflows.prospecting.updateWorkflowStatus, {
+      workspaceId: args.workspaceId,
+      status: "paused",
+      pauseReason: "manual",
+    });
+    // Close the narrow race where a job is enqueued between the first lane
+    // pause and the durable workspace status update above.
+    await ctx.runMutation(internal.tenantScheduler.pauseWorkspaceInternal, {
+      workspaceId: args.workspaceId,
+    });
+    await ctx.runMutation(
+      internal.workspaces.clearOnboardingIssueStateForSourceInternal,
+      {
+        workspaceId: args.workspaceId,
+        source: "workflow",
+      }
+    );
+    await ctx.runMutation(
+      internal.workspaces.clearProspectingRecoveryStateInternal,
+      {
+        workspaceId: args.workspaceId,
+      }
+    );
+
+    return {
+      success: true,
+    };
+  },
+});
+
+/**
+ * Get the prospecting workflow status for a workspace.
+ */
+export const getProspectingWorkflowStatus = query({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return null;
+    }
+
+    const user = await getUserByIdentity(ctx, identity);
+    if (!user) {
+      return null;
+    }
+
+    const workspace = await getOwnedWorkspace(ctx, args.workspaceId, user._id);
+    if (!workspace) {
+      return null;
+    }
+
+    return {
+      workflowId: workspace.prospectingWorkflowId,
+      status: workspace.prospectingWorkflowStatus || "stopped",
+      startedAt: workspace.prospectingWorkflowStartedAt,
+    };
+  },
+});

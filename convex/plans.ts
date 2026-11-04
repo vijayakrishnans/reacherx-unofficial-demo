@@ -1,0 +1,165 @@
+// convex/plans.ts
+// v4: Plan management queries and mutations
+
+import { type QueryCtx } from "./_generated/server";
+import { internalQuery, mutation, query } from "./lib/functionBuilders";
+import { v } from "convex/values";
+import { getOwnedWorkspace, requireUser } from "./lib/accessHelpers";
+import { getUserFromIdentity } from "./lib/userUtils";
+import {
+  getOrCreateUserPlan,
+  canAddProspects,
+  canCreateWorkspace,
+  canUsePaidFeatures,
+  getPlanUsageSummary,
+  PLAN_LIMITS,
+} from "./lib/planHelpers";
+
+async function getWorkspaceCreationEligibilityForCurrentUser(ctx: QueryCtx) {
+  const identity = await ctx.auth.getUserIdentity();
+  if (!identity) {
+    return {
+      allowed: false,
+      tier: "free" as const,
+      used: 0,
+      limit: PLAN_LIMITS.free.workspacesLimit,
+      remaining: 0,
+      reason: "Not authenticated",
+    };
+  }
+
+  const user = await getUserFromIdentity(ctx, identity, false);
+  if (!user) {
+    return {
+      allowed: false,
+      tier: "free" as const,
+      used: 0,
+      limit: PLAN_LIMITS.free.workspacesLimit,
+      remaining: 0,
+      reason: "User not found",
+    };
+  }
+
+  return canCreateWorkspace(ctx, user._id);
+}
+
+/**
+ * Get the current user's plan and usage
+ */
+export const getCurrentPlan = query({
+  args: {},
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) return null;
+
+    const user = await getUserFromIdentity(ctx, identity, false);
+    if (!user) return null;
+
+    return getPlanUsageSummary(ctx, user._id);
+  },
+});
+
+/**
+ * Get plan limits configuration (public info)
+ */
+export const getPlanLimits = query({
+  args: {},
+  handler: async () => {
+    return PLAN_LIMITS;
+  },
+});
+
+/**
+ * Check if user can add prospects
+ */
+export const checkCanAddProspects = query({
+  args: {
+    workspaceId: v.id("workspaces"),
+    count: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return { allowed: false, reason: "Not authenticated" };
+    }
+
+    const user = await getUserFromIdentity(ctx, identity, false);
+    if (!user) {
+      return { allowed: false, reason: "User not found" };
+    }
+
+    const workspace = await getOwnedWorkspace(ctx, args.workspaceId, user._id);
+    if (!workspace) {
+      return { allowed: false, reason: "Workspace not found" };
+    }
+
+    return canAddProspects(ctx, workspace._id, args.count ?? 1);
+  },
+});
+
+/**
+ * Check if user can create a workspace
+ */
+export const checkCanCreateWorkspace = query({
+  args: {},
+  handler: async (ctx) => {
+    return getWorkspaceCreationEligibilityForCurrentUser(ctx);
+  },
+});
+
+/**
+ * Canonical workspace creation eligibility for UI consumers.
+ */
+export const getWorkspaceCreationEligibility = query({
+  args: {},
+  handler: async (ctx) => {
+    return getWorkspaceCreationEligibilityForCurrentUser(ctx);
+  },
+});
+
+/**
+ * Canonical workspace creation eligibility for internal/backend consumers.
+ */
+export const getWorkspaceCreationEligibilityByUserId = internalQuery({
+  args: {
+    userId: v.id("users"),
+    consumeEntitlementSlot: v.optional(v.number()),
+    excludeSetupSessionId: v.optional(v.id("workspaceSetupSessions")),
+  },
+  handler: async (ctx, args) => {
+    return canCreateWorkspace(ctx, args.userId, {
+      consumeEntitlementSlot: args.consumeEntitlementSlot,
+      excludeSetupSessionId: args.excludeSetupSessionId,
+    });
+  },
+});
+
+export const getPaidFeatureEligibilityByUserId = internalQuery({
+  args: {
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args) => {
+    return canUsePaidFeatures(ctx, args.userId);
+  },
+});
+
+/**
+ * Initialize user plan (called during onboarding or first login)
+ */
+export const initializeUserPlan = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const user = await requireUser(ctx);
+    const plan = await getOrCreateUserPlan(ctx, user._id);
+
+    if (!plan) {
+      throw new Error("Failed to create user plan");
+    }
+
+    return {
+      tier: plan.tier,
+      prospectsLimit: plan.prospectsLimit,
+      workspacesLimit: plan.workspacesLimit,
+    };
+  },
+});

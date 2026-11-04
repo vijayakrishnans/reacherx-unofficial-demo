@@ -1,0 +1,1185 @@
+import { formatSyntheticTargetingExamples } from "../lib/syntheticProfileCore";
+import { getLearningTargetingFingerprint } from "../lib/learningTargetingHelpers";
+import { v } from "convex/values";
+import { vWorkflowId, type WorkflowId } from "@convex-dev/workflow";
+import { vResultValidator } from "@convex-dev/workpool";
+import { workflow } from "../lib/workflow";
+import { internal } from "../_generated/api";
+import { internalAction, internalMutation } from "../lib/functionBuilders";
+import { getQualificationPool } from "../lib/qualificationPool";
+import { previewQualificationPool } from "../lib/previewQualificationPool";
+import { QUALIFICATION_THRESHOLD } from "../lib/qualificationCore";
+import { evaluateQualificationWithExternalArticles } from "../lib/qualificationEvaluationCore";
+import { indexEvidencePosts, type EvidencePost } from "../lib/ragIndexing";
+import {
+  prospectPlatformValidator,
+  workspaceTargetingSpecValidator,
+  workspaceUseCaseKeyValidator,
+} from "../validators";
+import { isRecord, getNestedRecord } from "../lib/typeGuards";
+import { logger } from "../../shared/lib/logger";
+import { resolveWorkspaceUseCaseKey } from "../../shared/lib/workspaceUseCases";
+import { getWorkflowEvidencePostText } from "../lib/workflowSafeProspect";
+import { isValidatedSetupPreviewProspect } from "../lib/setupSessionCore";
+import type { Doc, Id } from "../_generated/dataModel";
+import type { ActionCtx } from "../_generated/server";
+import { getCurrentUTCTimestamp } from "../../shared/lib/utils/time/timeUtils";
+import {
+  parseQualificationModelFailure,
+  getQualificationFailureRetryDelayMs,
+  hasReachedQualificationRetryCap,
+  isAiCreditExhaustionError,
+  shouldRecoverQualificationWorkflowStatusError,
+  QUALIFICATION_MODEL_FAILURE_CODE,
+} from "../lib/qualificationFailureCore";
+import { TENANT_JOB_PRIORITY } from "../lib/tenantSchedulerCore";
+import { enqueueTenantJobWithRetry } from "../lib/tenantSchedulerEnqueue";
+import { completeTenantJob } from "../lib/tenantSchedulerHelpers";
+import { areAutonomousJobsPaused } from "../lib/autonomousJobHelpers";
+import { buildLegacyWorkspaceTargetingSpec } from "../lib/targetingSpecCore";
+import { isWorkspaceAutomationActive } from "../lib/workspaceSystem";
+const qualificationWorkflowLogger = logger.withScope("QualificationWorkflow");
+
+async function hasValidatedSetupPreviewContext(
+  ctx: ActionCtx,
+  prospect: Doc<"prospects">,
+  workspaceId: Doc<"workspaces">["_id"]
+): Promise<boolean> {
+  if (!prospect.setupSessionId) {
+    return false;
+  }
+
+  const [session, workspace] = await Promise.all([
+    ctx.runQuery(internal.setupSessions.getByIdInternal, {
+      sessionId: prospect.setupSessionId,
+    }),
+    ctx.runQuery(internal.workspaces.getById, { workspaceId }),
+  ]);
+
+  return Boolean(
+    workspace &&
+    isValidatedSetupPreviewProspect({
+      prospect,
+      session,
+      workspaceUserId: workspace.userId,
+      workspaceId,
+    })
+  );
+}
+
+// ============================================================================
+// Qualification Action (Node.js runtime)
+// ============================================================================
+
+/**
+ * Internal action that runs qualification logic.
+ * Uses qualifyProspectCore from lib/qualificationCore.ts (single source of truth).
+ *
+ * This is separated from the workflow to run in Node.js runtime
+ * where AI calls are supported.
+ */
+export const runQualificationCore = internalAction({
+  args: {
+    evidencePosts: v.array(v.any()),
+    platform: prospectPlatformValidator,
+    discoveryQueries: v.array(v.string()),
+    totalKeywords: v.number(),
+    profileData: v.any(),
+    targetingSpec: workspaceTargetingSpecValidator,
+    workspaceId: v.id("workspaces"),
+    prospectId: v.id("prospects"),
+    icpDescription: v.optional(v.string()),
+    syntheticTargetingExamples: v.optional(v.string()),
+    icpPainPoints: v.optional(v.array(v.string())),
+    useCaseKey: v.optional(workspaceUseCaseKeyValidator),
+    relevantMemories: v.optional(v.array(v.string())),
+    workspaceMemoryPolicy: v.optional(v.string()),
+    complianceInstructions: v.optional(v.array(v.string())),
+    similarQualifiedCases: v.optional(v.array(v.string())),
+    similarDisqualifiedCases: v.optional(v.array(v.string())),
+    routing: v.optional(
+      v.union(
+        v.literal("fast"),
+        v.literal("reasoning"),
+        v.literal("onboarding")
+      )
+    ),
+  },
+  handler: async (ctx, args) => {
+    return await evaluateQualificationWithExternalArticles(ctx, {
+      evidencePosts: args.evidencePosts as Array<Record<string, unknown>>,
+      platform: args.platform,
+      discoveryQueries: args.discoveryQueries,
+      totalKeywords: args.totalKeywords,
+      profileData: args.profileData as Record<string, unknown>,
+      targetingSpec: args.targetingSpec,
+      workspaceId: args.workspaceId,
+      prospectId: args.prospectId,
+      icpDescription: args.icpDescription,
+      syntheticTargetingExamples: args.syntheticTargetingExamples,
+      icpPainPoints: args.icpPainPoints,
+      useCaseKey: resolveWorkspaceUseCaseKey(args.useCaseKey),
+      relevantMemories: args.relevantMemories,
+      workspaceMemoryPolicy: args.workspaceMemoryPolicy,
+      complianceInstructions: args.complianceInstructions,
+      similarQualifiedCases: args.similarQualifiedCases,
+      similarDisqualifiedCases: args.similarDisqualifiedCases,
+      routing: args.routing,
+    });
+  },
+});
+
+/**
+ * Internal action to index evidence posts to RAG.
+ * Called after qualification succeeds.
+ */
+export const indexQualificationEvidence = internalAction({
+  args: {
+    prospectId: v.string(),
+    evidencePosts: v.array(
+      v.object({
+        id: v.string(),
+        text: v.string(),
+        url: v.optional(v.string()),
+        platform: prospectPlatformValidator,
+      })
+    ),
+  },
+  handler: async (ctx, args) => {
+    const posts: EvidencePost[] = args.evidencePosts;
+    return await indexEvidencePosts(ctx, args.prospectId, posts);
+  },
+});
+
+// ============================================================================
+// Qualification Workflow
+// ============================================================================
+
+/**
+ * Qualifies a single prospect by analyzing their profile and evidence posts.
+ * Delegates all qualification logic to qualificationCore.ts (single source of truth).
+ *
+ * Flow:
+ * 1. Get prospect data
+ * 2. Skip if already qualified
+ * 3. Get workspace for keyword context
+ * 4. Run qualification via runQualificationCore action
+ * 5. Update prospect with result
+ * 6. If qualified, index evidence to RAG and start enrichment
+ */
+export const qualificationWorkflow = workflow.define({
+  args: {
+    expectedTargetingFingerprint: v.optional(v.string()),
+    prospectId: v.id("prospects"),
+    workspaceId: v.id("workspaces"),
+  },
+  returns: v.object({
+    success: v.boolean(),
+    qualified: v.optional(v.boolean()),
+    score: v.optional(v.number()),
+    skipped: v.optional(v.boolean()),
+    error: v.optional(v.string()),
+  }),
+  handler: async (
+    step,
+    args
+  ): Promise<{
+    success: boolean;
+    qualified?: boolean;
+    score?: number;
+    skipped?: boolean;
+    error?: string;
+  }> => {
+    // Step 1: Get prospect data
+    const prospect = await step.runQuery(
+      internal.prospects.getProspectWorkflowDataInternal,
+      { prospectId: args.prospectId }
+    );
+
+    if (!prospect || prospect.workspaceId !== args.workspaceId) {
+      return {
+        success: false,
+        error: "Profile not found in this workspace",
+      };
+    }
+
+    await step.runMutation(internal.prospects.setQualificationWorkflowId, {
+      prospectId: args.prospectId,
+      workflowId: String(step.workflowId),
+    });
+
+    const isSetupPreview = prospect.origin === "setup_preview";
+    if (isSetupPreview) {
+      if (!prospect.setupSessionId) {
+        await step.runMutation(
+          internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+          {
+            prospectId: args.prospectId,
+            workflowId: String(step.workflowId),
+          }
+        );
+        return {
+          success: true,
+          qualified: false,
+          score: prospect.qualificationScore,
+        };
+      }
+
+      const setupSession = await step.runQuery(
+        internal.setupSessions.getByIdInternal,
+        {
+          sessionId: prospect.setupSessionId,
+        }
+      );
+      if (!setupSession || setupSession.status === "discarded") {
+        await step.runMutation(
+          internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+          {
+            prospectId: args.prospectId,
+            workflowId: String(step.workflowId),
+          }
+        );
+        return {
+          success: true,
+          qualified: false,
+          score: prospect.qualificationScore,
+        };
+      }
+    }
+
+    // Skip if already qualified
+    if (
+      prospect.qualificationStatus === "qualified" ||
+      prospect.qualificationStatus === "disqualified"
+    ) {
+      await step.runMutation(
+        internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+        {
+          prospectId: args.prospectId,
+          workflowId: String(step.workflowId),
+        }
+      );
+      return {
+        success: true,
+        qualified: prospect.qualificationStatus === "qualified",
+        score: prospect.qualificationScore,
+      };
+    }
+
+    if (prospect.status === "archived") {
+      await step.runMutation(
+        internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+        {
+          prospectId: args.prospectId,
+          workflowId: String(step.workflowId),
+        }
+      );
+      return {
+        success: true,
+        skipped: true,
+        qualified: false,
+        score: prospect.qualificationScore,
+      };
+    }
+
+    // Step 2: Get workspace for ICPs and keywords
+    const workspace = await step.runQuery(internal.workspaces.getById, {
+      workspaceId: args.workspaceId,
+    });
+
+    if (!workspace) {
+      await step.runMutation(
+        internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+        {
+          prospectId: args.prospectId,
+          workflowId: String(step.workflowId),
+        }
+      );
+      return {
+        success: false,
+        error: "Workspace not found",
+      };
+    }
+    if (
+      args.expectedTargetingFingerprint !== undefined &&
+      args.expectedTargetingFingerprint !==
+        getLearningTargetingFingerprint(workspace)
+    ) {
+      await step.runMutation(
+        internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+        { prospectId: args.prospectId, workflowId: String(step.workflowId) }
+      );
+      return { success: true, skipped: true, qualified: false };
+    }
+
+    // Execution-time gate: tenant-scheduler dispatch and recovery re-claims
+    // reach this workflow directly, so a workspace that paused, hit its
+    // match limit, or lost its provider after the claim must park here
+    // instead of spending evidence and LLM compute. The prospect stays
+    // pending and recovery re-arms it when the block clears.
+    const gate = await step.runQuery(
+      internal.lib.backgroundWorkGuards.checkBackgroundWorkAllowedInternal,
+      { workspaceId: args.workspaceId, prospectId: args.prospectId }
+    );
+    if (!gate.allowed) {
+      qualificationWorkflowLogger.warn(
+        "Qualification parked by execution-time gate",
+        {
+          prospectId: String(args.prospectId),
+          workspaceId: String(args.workspaceId),
+          reasons: gate.reasons,
+        }
+      );
+      await step.runMutation(
+        internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+        {
+          prospectId: args.prospectId,
+          workflowId: String(step.workflowId),
+        }
+      );
+      return {
+        success: true,
+        skipped: true,
+        qualified: false,
+        score: prospect.qualificationScore,
+      };
+    }
+    // Build keywords from ICPs
+    const allKeywords: string[] = [];
+    for (const icp of workspace.icps || []) {
+      if (icp.painPoints) {
+        allKeywords.push(...icp.painPoints);
+      }
+    }
+
+    // Step 3: Prepare data for qualification (with runtime type guards)
+    const prospectData = isRecord(prospect.data) ? prospect.data : {};
+    const rawEvidencePosts = Array.isArray(prospect.evidencePosts)
+      ? (prospect.evidencePosts as Array<Record<string, unknown>>)
+      : [];
+    const discoveryQueries = Array.isArray(
+      prospect.discoveryContext?.matchedQueries
+    )
+      ? prospect.discoveryContext.matchedQueries
+      : [];
+
+    // Jev pre-filter shadow measurement: logs what the decision model would
+    // have done before paid qualification. Off by default; never gates
+    // qualification (the action never throws).
+    const prefilterMode = await step.runQuery(
+      internal.jevPrefilterStore.getJevPrefilterModeInternal,
+      {}
+    );
+    if (prefilterMode === "shadow") {
+      // Platform-level step rejections must never block paid qualification.
+      try {
+        await step.runAction(
+          internal.jevPrefilterShadow.runJevPrefilterShadowInternal,
+          {
+            workspaceId: args.workspaceId,
+            userId: workspace.userId,
+            prospectId: args.prospectId,
+          }
+        );
+      } catch (error) {
+        console.warn(
+          `[JevPrefilter] Shadow step failed for prospect ${args.prospectId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+
+    // Extract profile data for authenticity analysis
+    const profileData =
+      getNestedRecord(prospectData, "user") ||
+      getNestedRecord(prospectData, "author") ||
+      prospectData;
+
+    const learningContext = await step.runAction(
+      internal.memory.getQualificationLearningContextInternal,
+      {
+        workspaceId: String(args.workspaceId),
+        userId: String(workspace.userId),
+        prospectId: String(args.prospectId),
+        title:
+          (prospect.title as string | undefined) ||
+          ((profileData.name as string | undefined) ?? undefined),
+        briefIntro: prospect.briefIntro,
+        matchedKeywords: discoveryQueries,
+        evidenceHighlights: rawEvidencePosts
+          .flatMap((post) => {
+            const text = getWorkflowEvidencePostText(post).trim();
+            return text ? [text] : [];
+          })
+          .slice(0, 5),
+      }
+    );
+    const targetingSpec =
+      workspace.targetingSpec ??
+      buildLegacyWorkspaceTargetingSpec({
+        description: workspace.description,
+        profiles: workspace.icps ?? [],
+      });
+
+    // Re-check the gate right before the paid LLM evaluation: queued
+    // workflows that started while the workspace was active must stop here
+    // if it paused, hit its match limit, or lost its provider in the
+    // meantime, instead of spending the most expensive step.
+    const preEvaluationGate = await step.runQuery(
+      internal.lib.backgroundWorkGuards.checkBackgroundWorkAllowedInternal,
+      { workspaceId: args.workspaceId, prospectId: args.prospectId }
+    );
+    if (!preEvaluationGate.allowed) {
+      qualificationWorkflowLogger.warn(
+        "Qualification parked before paid evaluation",
+        {
+          prospectId: String(args.prospectId),
+          workspaceId: String(args.workspaceId),
+          reasons: preEvaluationGate.reasons,
+        }
+      );
+      await step.runMutation(
+        internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+        {
+          prospectId: args.prospectId,
+          workflowId: String(step.workflowId),
+        }
+      );
+      return {
+        success: true,
+        skipped: true,
+        qualified: false,
+        score: prospect.qualificationScore,
+      };
+    }
+
+    // Step 4: Run qualification via action (AI calls require Node.js runtime)
+    const result = await step.runAction(
+      internal.workflows.qualification.runQualificationCore,
+      {
+        evidencePosts: rawEvidencePosts,
+        platform: prospect.platform,
+        discoveryQueries,
+        totalKeywords: allKeywords.length || 1, // Avoid division by zero
+        profileData,
+        targetingSpec,
+        workspaceId: args.workspaceId,
+        prospectId: args.prospectId,
+        icpDescription: workspace.description,
+        syntheticTargetingExamples: formatSyntheticTargetingExamples(
+          workspace.icps ?? []
+        ),
+        icpPainPoints: allKeywords,
+        useCaseKey: workspace.useCaseKey,
+        relevantMemories: learningContext.relevantMemories,
+        workspaceMemoryPolicy: learningContext.policyPrompt,
+        complianceInstructions: learningContext.complianceInstructions,
+        similarQualifiedCases: learningContext.similarQualifiedCases,
+        similarDisqualifiedCases: learningContext.similarDisqualifiedCases,
+        routing: "onboarding",
+      }
+    );
+
+    // Step 5: Update prospect with qualification result
+    const qualificationUpdate = await step.runMutation(
+      internal.prospects.updateProspectQualification,
+      {
+        prospectId: args.prospectId,
+        expectedTargetingFingerprint:
+          getLearningTargetingFingerprint(workspace),
+        qualificationStatus: result.status,
+        qualificationReasoning: result.matchReasoning ?? result.reasoning,
+        qualificationScore: result.score,
+        qualificationScoreBreakdown: result.scoreBreakdown,
+        qualificationCriteriaVersion: 1,
+        qualificationCriterionResults: result.criterionResults,
+        qualifiedAt: result.qualifiedAt,
+        qualificationKeywords: result.matchedKeywords,
+        qualificationSources: result.qualificationSources,
+        qualificationVerification: result.qualificationVerification,
+        authenticity: result.authenticity,
+      }
+    );
+
+    if (qualificationUpdate.skipped) {
+      await step.runMutation(
+        internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+        {
+          prospectId: args.prospectId,
+          workflowId: String(step.workflowId),
+        }
+      );
+      return {
+        success: true,
+        qualified: false,
+        score: result.score,
+        skipped: true,
+      };
+    }
+
+    const currentProspect = await step.runQuery(
+      internal.prospects.getProspectWorkflowDataInternal,
+      { prospectId: args.prospectId }
+    );
+
+    if (!currentProspect) {
+      await step.runMutation(
+        internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+        {
+          prospectId: args.prospectId,
+          workflowId: String(step.workflowId),
+        }
+      );
+      return {
+        success: true,
+        qualified: result.qualified,
+        score: result.score,
+        skipped: true,
+      };
+    }
+
+    const isStillSetupPreview = currentProspect.origin === "setup_preview";
+
+    // Log qualification activity
+    await step.runMutation(internal.outreach.logActivity, {
+      prospectId: args.prospectId,
+      workspaceId: args.workspaceId,
+      type: "qualified",
+      title: result.qualified
+        ? `Good match · ${result.score}% match`
+        : `Not a match · ${result.score}% match`,
+      description: result.qualified
+        ? `Match score: ${result.score}. Minimum required: ${QUALIFICATION_THRESHOLD}.${isStillSetupPreview ? "" : " Finding profile details next."}`
+        : `Scored ${result.score}. Minimum required: ${QUALIFICATION_THRESHOLD}.`,
+    });
+    await step.runMutation(internal.memory.recordMemoryWorkflowEventInternal, {
+      workspaceId: args.workspaceId,
+      eventType: "qualification_completed",
+      sourceType: "prospect",
+      sourceId: String(args.prospectId),
+      workflowName: "qualificationWorkflow",
+      prospectId: args.prospectId,
+      payload: {
+        targetingFingerprint: getLearningTargetingFingerprint(workspace),
+        qualified: result.qualified,
+        status: result.status,
+        score: result.score,
+        discoveryQueries: result.qualificationVerification.discoveryQueries,
+        evidenceValidated:
+          result.qualificationVerification.status === "validated" &&
+          result.qualificationVerification.candidateSourceCount > 0,
+        qualificationSourceCount: result.qualificationSources.length,
+        reasoning: result.reasoning,
+      },
+      eventKey: `qualification:${String(step.workflowId)}:completed`,
+    });
+
+    const evidenceValidationCompleted =
+      result.qualificationVerification.status === "validated" &&
+      result.qualificationVerification.candidateSourceCount > 0;
+
+    if (!isStillSetupPreview && evidenceValidationCompleted) {
+      await step
+        .runAction(internal.memory.indexWorkspaceProspectSummaryInternal, {
+          targetingFingerprint: getLearningTargetingFingerprint(workspace),
+          workspaceId: String(args.workspaceId),
+          prospectId: String(args.prospectId),
+          namespace: result.qualified ? "verified_wins" : "verified_losses",
+          displayName:
+            currentProspect.displayName ||
+            currentProspect.title ||
+            "Unknown prospect",
+          title: currentProspect.title,
+          briefIntro: currentProspect.briefIntro,
+          qualificationStatus: result.status,
+          qualificationScore: result.score,
+          matchedKeywords: result.matchedKeywords,
+          finance: currentProspect.finance?.displayValue,
+          reasoning: result.reasoning,
+          importance: result.qualified ? 0.8 : 0.65,
+        })
+        .catch((error) => {
+          qualificationWorkflowLogger.warn(
+            "Workspace summary indexing failed",
+            {
+              workspaceId: String(args.workspaceId),
+              workspaceName: workspace.name,
+              prospectId: String(args.prospectId),
+            },
+            error instanceof Error ? error : new Error(String(error))
+          );
+        });
+    }
+
+    if (!isStillSetupPreview) {
+      await step
+        .runAction(internal.memory.indexProspectSearchListInternal, {
+          prospectId: args.prospectId,
+        })
+        .catch((error) => {
+          qualificationWorkflowLogger.warn(
+            "Prospect list search RAG indexing failed",
+            {
+              workspaceId: String(args.workspaceId),
+              workspaceName: workspace.name,
+              prospectId: String(args.prospectId),
+            },
+            error instanceof Error ? error : new Error(String(error))
+          );
+        });
+    }
+
+    // Step 6: If qualified, index evidence to RAG and start enrichment
+    if (result.qualified) {
+      // Convert evidence posts for RAG indexing
+      const platform = (currentProspect.platform || "twitter") as
+        | "twitter"
+        | "linkedin";
+      const evidenceForRag = result.qualificationSources.map((source) => ({
+        id: source.sourceId,
+        text: source.text,
+        url: source.evidenceUrl ?? source.sourceUrl,
+        platform,
+      }));
+
+      // Index evidence posts to RAG (fire and forget, don't block workflow)
+      if (!isStillSetupPreview) {
+        await step
+          .runAction(
+            internal.workflows.qualification.indexQualificationEvidence,
+            {
+              prospectId: args.prospectId,
+              evidencePosts: evidenceForRag.filter((p) => p.text.length > 0),
+            }
+          )
+          .catch((error) => {
+            qualificationWorkflowLogger.warn(
+              "Qualification RAG indexing failed",
+              {
+                workspaceId: String(args.workspaceId),
+                workspaceName: workspace.name,
+                prospectId: String(args.prospectId),
+              },
+              error instanceof Error ? error : new Error(String(error))
+            );
+          });
+      }
+
+      // Start enrichment workflow
+      if (!isStillSetupPreview) {
+        await step.runAction(internal.workflows.enrichment.startEnrichment, {
+          prospectId: args.prospectId,
+          workspaceId: args.workspaceId,
+        });
+      }
+    }
+
+    await step.runMutation(
+      internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+      {
+        prospectId: args.prospectId,
+        workflowId: String(step.workflowId),
+      }
+    );
+
+    return {
+      success: true,
+      qualified: result.qualified,
+      score: result.score,
+    };
+  },
+});
+
+// ============================================================================
+// Workflow Starters
+// ============================================================================
+
+/**
+ * Run qualification workflow for a prospect.
+ * This is the internal action that actually starts the workflow.
+ */
+export const runQualificationWorkflow = internalAction({
+  args: {
+    prospectId: v.id("prospects"),
+    workspaceId: v.id("workspaces"),
+    tenantJobId: v.optional(v.id("tenantJobs")),
+  },
+  handler: async (ctx, args): Promise<{ workflowId: string }> => {
+    const prospect = await ctx.runQuery(
+      internal.prospects.getProspectInternal,
+      {
+        prospectId: args.prospectId,
+      }
+    );
+    if (
+      !prospect ||
+      prospect.workspaceId !== args.workspaceId ||
+      (prospect.qualificationStatus !== undefined &&
+        prospect.qualificationStatus !== "pending") ||
+      prospect.status === "archived"
+    ) {
+      return { workflowId: "" };
+    }
+
+    const isValidatedSetupPreview = await hasValidatedSetupPreviewContext(
+      ctx,
+      prospect,
+      args.workspaceId
+    );
+    if (!isValidatedSetupPreview) {
+      // Execution-time gate for pool-dispatched work: the workspace may have
+      // paused, hit its match limit, or lost its provider after the job was
+      // enqueued. Limit hits also reconcile the workspace capacity state.
+      const gate = await ctx.runQuery(
+        internal.lib.backgroundWorkGuards.checkBackgroundWorkAllowedInternal,
+        { workspaceId: args.workspaceId, prospectId: args.prospectId }
+      );
+      if (gate.reasons.includes("prospect_limit_reached")) {
+        await ctx.runAction(
+          internal.workspaces.reconcileWorkspaceCapacityStateInternal,
+          {
+            workspaceId: args.workspaceId,
+          }
+        );
+      }
+      if (!gate.allowed) {
+        return { workflowId: "" };
+      }
+    }
+
+    return await ctx.runMutation(
+      internal.workflows.qualification.startQualificationWorkflowAtomically,
+      args
+    );
+  },
+});
+
+/** Claim the prospect and enqueue its workflow in one transaction. */
+export const startQualificationWorkflowAtomically = internalMutation({
+  args: {
+    prospectId: v.id("prospects"),
+    workspaceId: v.id("workspaces"),
+    tenantJobId: v.optional(v.id("tenantJobs")),
+  },
+  returns: v.object({ workflowId: v.string() }),
+  handler: async (ctx, args): Promise<{ workflowId: string }> => {
+    const prospect = await ctx.db.get(args.prospectId);
+    const workspace = await ctx.db.get(args.workspaceId);
+    if (
+      !prospect ||
+      !workspace ||
+      workspace.deletionStartedAt ||
+      // Claim-time pause check: queued claims must not start workflows for a
+      // workspace that paused after the job was queued.
+      !isWorkspaceAutomationActive(workspace) ||
+      prospect.workspaceId !== args.workspaceId ||
+      prospect.status === "archived" ||
+      (prospect.qualificationStatus !== undefined &&
+        prospect.qualificationStatus !== "pending")
+    ) {
+      return { workflowId: "" };
+    }
+    if (prospect.qualificationWorkflowId) {
+      return { workflowId: prospect.qualificationWorkflowId };
+    }
+    const workflowId = await workflow.start(
+      ctx,
+      internal.workflows.qualification.qualificationWorkflow,
+      { prospectId: args.prospectId, workspaceId: args.workspaceId },
+      {
+        startAsync: true,
+        onComplete:
+          internal.workflows.qualification.handleQualificationComplete,
+        context: { prospectId: args.prospectId, tenantJobId: args.tenantJobId },
+      }
+    );
+    await ctx.db.patch(prospect._id, {
+      qualificationWorkflowId: String(workflowId),
+      qualificationStatus: "pending",
+      updatedAt: getCurrentUTCTimestamp(),
+    });
+    return { workflowId: String(workflowId) };
+  },
+});
+
+/**
+ * Clears a failed workflow lease without changing qualification state. The
+ * model helper already exhausts its bounded structured-output retries before
+ * surfacing a model evaluation failure.
+ */
+export const handleQualificationComplete = internalMutation({
+  args: {
+    workflowId: vWorkflowId,
+    result: vResultValidator,
+    context: v.any(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const tenantJobId = (
+      args.context as {
+        prospectId: Id<"prospects">;
+        tenantJobId?: Id<"tenantJobs">;
+      }
+    ).tenantJobId;
+    if (args.result.kind === "success") {
+      if (tenantJobId) {
+        await completeTenantJob(ctx, {
+          jobId: tenantJobId,
+          status: "succeeded",
+        });
+      }
+      return null;
+    }
+
+    const prospectId = (args.context as { prospectId: Id<"prospects"> })
+      .prospectId;
+    const prospect = await ctx.db.get(prospectId);
+    if (!prospect) {
+      if (tenantJobId) {
+        await completeTenantJob(ctx, {
+          jobId: tenantJobId,
+          status: args.result.kind === "canceled" ? "cancelled" : "failed",
+          errorMessage:
+            args.result.kind === "failed" ? args.result.error : undefined,
+        });
+      }
+      return null;
+    }
+
+    const workflowId = String(args.workflowId);
+    if (
+      prospect.qualificationWorkflowId &&
+      prospect.qualificationWorkflowId !== workflowId
+    ) {
+      if (tenantJobId) {
+        await completeTenantJob(ctx, {
+          jobId: tenantJobId,
+          status: args.result.kind === "canceled" ? "cancelled" : "failed",
+          errorMessage:
+            args.result.kind === "failed" ? args.result.error : undefined,
+        });
+      }
+      return null;
+    }
+
+    const now = getCurrentUTCTimestamp();
+    if (args.result.kind === "failed") {
+      const modelFailure = parseQualificationModelFailure(args.result.error);
+      const previousWorkflowAttemptCount =
+        prospect.qualificationLastFailure?.workflowAttemptCount ?? 0;
+      const workflowAttemptCount = previousWorkflowAttemptCount + 1;
+      const nextRetryAt =
+        now + getQualificationFailureRetryDelayMs(workflowAttemptCount);
+      await ctx.db.patch(prospect._id, {
+        qualificationWorkflowId: undefined,
+        qualificationLastFailure: {
+          stage: modelFailure ? "model_evaluation" : "workflow",
+          provider: modelFailure?.provider ?? "convex_workflow",
+          model: modelFailure?.model,
+          code: modelFailure
+            ? QUALIFICATION_MODEL_FAILURE_CODE
+            : "qualification_workflow_failed",
+          message: modelFailure?.message ?? args.result.error,
+          attemptCount: modelFailure?.attemptCount,
+          workflowAttemptCount,
+          nextRetryAt,
+          failedAt: now,
+        },
+        updatedAt: now,
+      });
+      if (tenantJobId) {
+        await completeTenantJob(ctx, {
+          jobId: tenantJobId,
+          status: "failed",
+          errorMessage: args.result.error,
+        });
+      }
+
+      // Out of AI credits: retrying cannot succeed until the account is
+      // topped up. Pause the workspace's autonomous work instead of spinning.
+      if (isAiCreditExhaustionError(args.result.error)) {
+        qualificationWorkflowLogger.warn(
+          "Qualification stopped: AI provider credits exhausted",
+          {
+            prospectId: String(prospect._id),
+            workspaceId: String(prospect.workspaceId),
+          }
+        );
+        await ctx.scheduler.runAfter(
+          0,
+          internal.workspaces.pauseWorkspaceForAiCreditExhaustionInternal,
+          { workspaceId: prospect.workspaceId }
+        );
+        return null;
+      }
+
+      // Bounded automatic retries: after the cap the prospect keeps its
+      // failure state until a manual resume resets it for a fresh run.
+      if (hasReachedQualificationRetryCap(workflowAttemptCount)) {
+        qualificationWorkflowLogger.warn(
+          "Qualification retry cap reached; awaiting manual retry",
+          {
+            prospectId: String(prospect._id),
+            workspaceId: String(prospect.workspaceId),
+            workflowAttemptCount,
+          }
+        );
+        return null;
+      }
+
+      await ctx.scheduler.runAt(
+        nextRetryAt,
+        internal.workflows.qualification.startQualification,
+        {
+          prospectId: prospect._id,
+          workspaceId: prospect.workspaceId,
+          expectedFailureAt: now,
+        }
+      );
+      return null;
+    }
+
+    await ctx.db.patch(prospect._id, {
+      qualificationWorkflowId: undefined,
+      updatedAt: now,
+    });
+    if (tenantJobId) {
+      await completeTenantJob(ctx, {
+        jobId: tenantJobId,
+        status: "cancelled",
+      });
+    }
+    return null;
+  },
+});
+
+/**
+ * Start qualification for a prospect via Workpool.
+ * Called when prospects are created by the bounded search pipeline.
+ * This enqueues the workflow through Workpool to limit concurrent executions.
+ */
+export const startQualification = internalAction({
+  args: {
+    prospectId: v.id("prospects"),
+    workspaceId: v.id("workspaces"),
+    expectedFailureAt: v.optional(v.number()),
+  },
+  handler: async (ctx, args): Promise<{ workId: string }> => {
+    // The emergency brake stops scheduled retries from starting new work.
+    if (areAutonomousJobsPaused()) {
+      return { workId: "" };
+    }
+    let prospect = await ctx.runQuery(internal.prospects.getProspectInternal, {
+      prospectId: args.prospectId,
+    });
+    if (
+      !prospect ||
+      prospect.status === "archived" ||
+      prospect.qualificationStatus === "qualified" ||
+      prospect.qualificationStatus === "disqualified"
+    ) {
+      return { workId: "" };
+    }
+
+    // Autonomous qualification work only runs while the workspace's discovery
+    // pipeline is active. Paused, stopped, and plan-limited workspaces defer
+    // pending prospects until resume, where the recovery cron picks them up.
+    const workspace = await ctx.runQuery(internal.workspaces.getById, {
+      workspaceId: args.workspaceId,
+    });
+    if (!workspace || !isWorkspaceAutomationActive(workspace)) {
+      return { workId: "" };
+    }
+
+    if (typeof prospect.qualificationWorkflowId === "string") {
+      const existingWorkflowId = prospect.qualificationWorkflowId;
+      try {
+        const status = await workflow.status(
+          ctx,
+          existingWorkflowId as WorkflowId
+        );
+        if (status.type === "inProgress") {
+          return { workId: existingWorkflowId };
+        }
+      } catch (error) {
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
+        qualificationWorkflowLogger.warn(
+          "Unable to verify existing qualification workflow",
+          {
+            prospectId: String(prospect._id),
+            workspaceId: String(prospect.workspaceId),
+            workflowId: existingWorkflowId,
+          },
+          error instanceof Error ? error : new Error(String(error))
+        );
+        if (
+          !shouldRecoverQualificationWorkflowStatusError({
+            errorMessage,
+            leaseUpdatedAt: prospect.updatedAt,
+            now: getCurrentUTCTimestamp(),
+          })
+        ) {
+          return { workId: existingWorkflowId };
+        }
+      }
+
+      const cleared = await ctx.runMutation(
+        internal.prospects.clearQualificationWorkflowIdIfMatchesInternal,
+        {
+          prospectId: prospect._id,
+          workflowId: existingWorkflowId,
+        }
+      );
+      if (!cleared) {
+        return { workId: "" };
+      }
+      prospect = await ctx.runQuery(internal.prospects.getProspectInternal, {
+        prospectId: args.prospectId,
+      });
+      if (
+        !prospect ||
+        prospect.status === "archived" ||
+        prospect.qualificationStatus === "qualified" ||
+        prospect.qualificationStatus === "disqualified" ||
+        typeof prospect.qualificationWorkflowId === "string"
+      ) {
+        return { workId: "" };
+      }
+    }
+
+    const now = getCurrentUTCTimestamp();
+    const failure = prospect.qualificationLastFailure;
+    const retryFailureAt = args.expectedFailureAt ?? failure?.failedAt;
+    if (retryFailureAt !== undefined) {
+      const claimed = await ctx.runMutation(
+        internal.prospects.claimQualificationFailureRetryInternal,
+        {
+          prospectId: prospect._id,
+          expectedFailureAt: retryFailureAt,
+          now,
+        }
+      );
+      if (!claimed) {
+        return { workId: "" };
+      }
+      prospect = await ctx.runQuery(internal.prospects.getProspectInternal, {
+        prospectId: args.prospectId,
+      });
+      if (
+        !prospect ||
+        prospect.status === "archived" ||
+        prospect.qualificationStatus !== "pending" ||
+        typeof prospect.qualificationWorkflowId === "string"
+      ) {
+        return { workId: "" };
+      }
+    }
+
+    const gate = await ctx.runQuery(
+      internal.lib.backgroundWorkGuards.checkBackgroundWorkAllowedInternal,
+      {
+        workspaceId: args.workspaceId,
+        prospectId: prospect._id,
+      }
+    );
+    if (gate.reasons.includes("prospect_limit_reached")) {
+      await ctx.runAction(
+        internal.workspaces.reconcileWorkspaceCapacityStateInternal,
+        {
+          workspaceId: args.workspaceId,
+        }
+      );
+    }
+    if (!gate.allowed) {
+      return { workId: "" };
+    }
+
+    const tenantRoute = await enqueueTenantJobWithRetry(ctx, {
+      workspaceId: args.workspaceId,
+      userId: prospect.userId,
+      class: "background",
+      priority: TENANT_JOB_PRIORITY.background,
+      idempotencyKey: `qualification:${String(args.prospectId)}:${prospect.updatedAt}`,
+      payload: {
+        kind: "qualification",
+        prospectId: args.prospectId,
+        workspaceId: args.workspaceId,
+        preview: false,
+      },
+    });
+    if (tenantRoute.route === "enforced") {
+      return { workId: String(tenantRoute.jobId) };
+    }
+
+    const workId = await getQualificationPool().enqueueAction(
+      ctx,
+      internal.workflows.qualification.runQualificationWorkflow,
+      {
+        prospectId: args.prospectId,
+        workspaceId: args.workspaceId,
+      }
+    );
+
+    return { workId: workId.toString() };
+  },
+});
+
+export const startPreviewQualification = internalAction({
+  args: {
+    prospectId: v.id("prospects"),
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args): Promise<{ workId: string }> => {
+    const prospect = await ctx.runQuery(
+      internal.prospects.getProspectInternal,
+      {
+        prospectId: args.prospectId,
+      }
+    );
+    if (
+      !prospect ||
+      prospect.status === "archived" ||
+      prospect.qualificationStatus === "qualified" ||
+      prospect.qualificationStatus === "disqualified" ||
+      typeof prospect.qualificationWorkflowId === "string"
+    ) {
+      return { workId: "" };
+    }
+
+    if (
+      !(await hasValidatedSetupPreviewContext(ctx, prospect, args.workspaceId))
+    ) {
+      return { workId: "" };
+    }
+
+    const tenantRoute = await enqueueTenantJobWithRetry(ctx, {
+      workspaceId: args.workspaceId,
+      userId: prospect.userId,
+      class: "preview",
+      priority: TENANT_JOB_PRIORITY.preview,
+      idempotencyKey: `preview-qualification:${String(args.prospectId)}:${prospect.setupRevision ?? prospect.updatedAt}`,
+      payload: {
+        kind: "qualification",
+        prospectId: args.prospectId,
+        workspaceId: args.workspaceId,
+        preview: true,
+      },
+    });
+    if (tenantRoute.route === "enforced") {
+      return { workId: String(tenantRoute.jobId) };
+    }
+
+    const workId = await previewQualificationPool.enqueueAction(
+      ctx,
+      internal.workflows.qualification.runQualificationWorkflow,
+      {
+        prospectId: args.prospectId,
+        workspaceId: args.workspaceId,
+      }
+    );
+
+    return { workId: workId.toString() };
+  },
+});

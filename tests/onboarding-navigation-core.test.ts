@@ -1,0 +1,173 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  areSearchParamsEquivalent,
+  resolveOnboardingNavigationAction,
+} from "../features/webapp/lib/onboardingNavigationCore";
+
+const base = {
+  activeContextType: "setup_session" as const,
+  currentQueryString: "",
+  isDevelopmentSetupPreview: false,
+  locked: true,
+  pathname: "/",
+  targetLockedUrl: "/agent/setup?threadId=setup-thread",
+};
+
+test("active setup redirects ordinary app routes to its canonical thread", () => {
+  assert.deepEqual(resolveOnboardingNavigationAction(base), {
+    kind: "replace",
+    href: "/agent/setup?threadId=setup-thread",
+  });
+});
+
+test("active setup corrects a stale or different setup thread", () => {
+  assert.deepEqual(
+    resolveOnboardingNavigationAction({
+      ...base,
+      pathname: "/agent/setup",
+      currentQueryString: "threadId=old-thread",
+    }),
+    {
+      kind: "replace",
+      href: "/agent/setup?threadId=setup-thread",
+    }
+  );
+});
+
+test("an explicit setup thread survives a workspace-context transition", () => {
+  assert.deepEqual(
+    resolveOnboardingNavigationAction({
+      ...base,
+      activeContextType: "workspace",
+      pathname: "/agent/setup",
+      currentQueryString: "threadId=setup-thread",
+      locked: false,
+      targetLockedUrl: "/",
+    }),
+    { kind: "none" }
+  );
+});
+
+test("a completed workspace exits the bare setup route", () => {
+  assert.deepEqual(
+    resolveOnboardingNavigationAction({
+      ...base,
+      activeContextType: "workspace",
+      pathname: "/agent/setup",
+      currentQueryString: "",
+      locked: false,
+      targetLockedUrl: "/",
+    }),
+    { kind: "replace", href: "/" }
+  );
+});
+
+test("an unlocked refine session stays on its chat-first setup thread", () => {
+  assert.deepEqual(
+    resolveOnboardingNavigationAction({
+      ...base,
+      pathname: "/agent/setup",
+      currentQueryString: "threadId=refine-thread",
+      locked: false,
+      targetLockedUrl: "/agent/setup?threadId=refine-thread",
+    }),
+    { kind: "none" }
+  );
+});
+
+test("completed workspace context leaves ordinary app routes alone", () => {
+  assert.deepEqual(
+    resolveOnboardingNavigationAction({
+      ...base,
+      activeContextType: "workspace",
+      locked: false,
+      targetLockedUrl: "/",
+    }),
+    { kind: "none" }
+  );
+});
+
+test("explicit new-workspace bootstrap may render before its thread exists", () => {
+  assert.deepEqual(
+    resolveOnboardingNavigationAction({
+      ...base,
+      activeContextType: "workspace",
+      pathname: "/agent/setup",
+      currentQueryString: "action=newWorkspace",
+      locked: false,
+      targetLockedUrl: "/",
+    }),
+    { kind: "none" }
+  );
+});
+
+test("an active draft does not bypass the explicit new-workspace decision", () => {
+  assert.deepEqual(
+    resolveOnboardingNavigationAction({
+      ...base,
+      pathname: "/agent/setup",
+      currentQueryString: "action=newWorkspace",
+    }),
+    { kind: "none" }
+  );
+});
+
+test("setup auth result parameters are preserved until their callback is handled", () => {
+  assert.deepEqual(
+    resolveOnboardingNavigationAction({
+      ...base,
+      pathname: "/agent/setup",
+      currentQueryString: "threadId=setup-thread&linkedin_status=success",
+    }),
+    { kind: "none" }
+  );
+});
+
+test("first-workspace legacy recovery keeps an explicit setup thread", () => {
+  assert.deepEqual(
+    resolveOnboardingNavigationAction({
+      ...base,
+      activeContextType: "workspace",
+      pathname: "/agent/setup",
+      currentQueryString: "threadId=recovery-thread",
+      targetLockedUrl: "/agent/setup",
+    }),
+    { kind: "none" }
+  );
+});
+
+test("query comparison is order-independent but value-sensitive", () => {
+  assert.equal(
+    areSearchParamsEquivalent("threadId=one&state=ok", "state=ok&threadId=one"),
+    true
+  );
+  assert.equal(
+    areSearchParamsEquivalent("threadId=one", "threadId=two"),
+    false
+  );
+});
+
+test("setup allows the central connected accounts page and its OAuth callback", () => {
+  for (const currentQueryString of [
+    "",
+    "linkedin_status=success&account_id=test",
+    "code=test&state=test",
+  ]) {
+    assert.deepEqual(
+      resolveOnboardingNavigationAction({
+        ...base,
+        pathname: "/settings/connected-accounts",
+        currentQueryString,
+      }),
+      { kind: "none" }
+    );
+  }
+  assert.deepEqual(
+    resolveOnboardingNavigationAction({
+      ...base,
+      pathname: "/settings/other",
+    }),
+    { kind: "replace", href: base.targetLockedUrl }
+  );
+});

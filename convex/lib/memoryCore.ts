@@ -1,0 +1,528 @@
+import { getStringProperty, isRecord } from "./typeGuards";
+import {
+  getLearningTargetingFingerprint,
+  isCurrentTargetingLearning,
+} from "./learningTargetingHelpers";
+import type { GenericDatabaseWriter } from "convex/server";
+import type { DataModel, Doc, Id } from "../_generated/dataModel";
+import type { MutationCtx } from "../_generated/server";
+import { internal } from "../_generated/api";
+import { getCurrentUTCTimestamp } from "../../shared/lib/utils/time/timeUtils";
+import {
+  buildMemoryWorkflowEventKey,
+  buildQueryCandidateCanonicalRecord,
+  buildQueryCandidateEmbeddingDocKey,
+} from "./memoryHelpers";
+import {
+  mergeWorkspaceQueryPerformanceDailyDelta,
+  isWorkspaceQueryPerformanceDailyRecordEmpty,
+} from "./agentOpsReadModelHelpers";
+import { getUtcDayStartTimestamp } from "./readModelHelpers";
+import {
+  isEvaluatorRelevantEventType,
+  resolveDefaultMemoryWorkflowEventStatus,
+} from "./memoryEvaluatorCore";
+import type { TwitterProspectingSearchMode } from "./twitterProspectingSearchCore";
+
+type MemoryDbWriter = GenericDatabaseWriter<DataModel>;
+
+function calculateRate(numerator: number, denominator: number): number {
+  if (denominator <= 0) {
+    return 0;
+  }
+  return (numerator / denominator) * 100;
+}
+
+export function calculateQueryPerformanceScore(args: {
+  prospectsFound: number;
+  qualifiedCount: number;
+  convertedCount: number;
+  replyCount: number;
+  replyRate: number;
+  qualificationRate: number;
+}) {
+  return (
+    args.convertedCount * 100 +
+    args.replyCount * 25 +
+    args.qualifiedCount * 10 +
+    args.prospectsFound * 2 +
+    args.replyRate +
+    args.qualificationRate
+  );
+}
+
+function resolveQueryCandidateStatus(
+  previousStatus: Doc<"queryCandidates">["status"] | null,
+  nextStatus: Doc<"queryCandidates">["status"]
+): Doc<"queryCandidates">["status"] {
+  if (!previousStatus) return nextStatus;
+  if (previousStatus === "retired" || nextStatus === "retired") {
+    return "retired";
+  }
+  if (previousStatus === "activated" || nextStatus === "activated") {
+    return "activated";
+  }
+  if (
+    previousStatus === "rejected_semantic_duplicate" ||
+    nextStatus === "rejected_semantic_duplicate"
+  ) {
+    return "rejected_semantic_duplicate";
+  }
+  if (
+    previousStatus === "rejected_exact_duplicate" ||
+    nextStatus === "rejected_exact_duplicate"
+  ) {
+    return "rejected_exact_duplicate";
+  }
+  if (
+    previousStatus === "rejected_low_novelty" ||
+    nextStatus === "rejected_low_novelty"
+  ) {
+    return "rejected_low_novelty";
+  }
+  return nextStatus;
+}
+
+export async function upsertQueryCandidateRecord(
+  db: MemoryDbWriter,
+  args: {
+    workspaceId: Id<"workspaces">;
+    expectedTargetingFingerprint?: string;
+    type: Doc<"queryCandidates">["type"];
+    rawValue: string;
+    sourceTheme?: string;
+    sourceRunId?: string;
+    platformTargets?: Array<"twitter" | "linkedin">;
+    linkedinSurface?: "posts" | "people";
+    linkedinSurfaceTargets?: Array<"posts" | "people">;
+    queryStyle?: "natural_phrase" | "professional_keyword" | "role_title";
+    twitterSearchMode?: TwitterProspectingSearchMode;
+    noveltyScore?: number;
+    status?: Doc<"queryCandidates">["status"];
+    duplicateReason?: Doc<"queryCandidates">["duplicateReason"];
+    performanceScore?: number;
+    activatedKeywordId?: Id<"keywords">;
+    embeddingDocKey?: string;
+  }
+) {
+  const workspace = await db.get(args.workspaceId);
+  if (!workspace) throw new Error("Workspace not found");
+  const targetingFingerprint = getLearningTargetingFingerprint(workspace);
+  if (
+    args.expectedTargetingFingerprint !== undefined &&
+    args.expectedTargetingFingerprint !== targetingFingerprint
+  )
+    throw new Error("Workspace targeting changed during query screening");
+  const now = getCurrentUTCTimestamp();
+  const canonical = buildQueryCandidateCanonicalRecord({
+    type: args.type,
+    value: args.rawValue,
+  });
+  const embeddingDocKey =
+    args.embeddingDocKey ??
+    buildQueryCandidateEmbeddingDocKey(
+      String(args.workspaceId),
+      canonical.canonicalKey
+    );
+  const existing = await db
+    .query("queryCandidates")
+    .withIndex("by_workspace_canonical_key", (q) =>
+      q
+        .eq("workspaceId", args.workspaceId)
+        .eq("canonicalKey", canonical.canonicalKey)
+    )
+    .first();
+
+  if (existing) {
+    const previous = isCurrentTargetingLearning(existing, workspace)
+      ? existing
+      : undefined;
+    const nextStatus = resolveQueryCandidateStatus(
+      previous?.status ?? null,
+      args.status ?? previous?.status ?? "generated"
+    );
+
+    await db.patch(existing._id, {
+      targetingFingerprint,
+      rawValue: args.rawValue,
+      sourceTheme: args.sourceTheme ?? previous?.sourceTheme,
+      sourceRunId: args.sourceRunId ?? previous?.sourceRunId,
+      platformTargets: args.platformTargets ?? previous?.platformTargets,
+      linkedinSurface: args.linkedinSurface ?? previous?.linkedinSurface,
+      linkedinSurfaceTargets:
+        args.linkedinSurfaceTargets ?? previous?.linkedinSurfaceTargets,
+      queryStyle: args.queryStyle ?? previous?.queryStyle,
+      twitterSearchMode: args.twitterSearchMode ?? previous?.twitterSearchMode,
+      noveltyScore: args.noveltyScore ?? previous?.noveltyScore,
+      status: nextStatus,
+      duplicateReason: args.duplicateReason ?? previous?.duplicateReason,
+      performanceScore: args.performanceScore ?? previous?.performanceScore,
+      activatedKeywordId:
+        args.activatedKeywordId ?? previous?.activatedKeywordId,
+      embeddingDocKey,
+      reviewedAt:
+        nextStatus === "activated" || nextStatus.startsWith("rejected_")
+          ? now
+          : previous?.reviewedAt,
+      lastEvaluatedAt: now,
+      retiredAt: nextStatus === "retired" ? now : previous?.retiredAt,
+      updatedAt: now,
+    });
+
+    return {
+      queryCandidateId: existing._id,
+      created: false,
+      ...canonical,
+      status: nextStatus,
+    };
+  }
+
+  const status = args.status ?? "generated";
+  const queryCandidateId = await db.insert("queryCandidates", {
+    workspaceId: args.workspaceId,
+    targetingFingerprint,
+    type: args.type,
+    rawValue: args.rawValue,
+    canonicalValue: canonical.canonicalValue,
+    canonicalHash: canonical.canonicalHash,
+    canonicalKey: canonical.canonicalKey,
+    sourceTheme: args.sourceTheme,
+    sourceRunId: args.sourceRunId,
+    platformTargets: args.platformTargets,
+    linkedinSurface: args.linkedinSurface,
+    linkedinSurfaceTargets: args.linkedinSurfaceTargets,
+    queryStyle: args.queryStyle,
+    twitterSearchMode: args.twitterSearchMode,
+    noveltyScore: args.noveltyScore,
+    status,
+    duplicateReason: args.duplicateReason,
+    performanceScore: args.performanceScore,
+    activatedKeywordId: args.activatedKeywordId,
+    embeddingDocKey,
+    updatedAt: now,
+    reviewedAt:
+      status === "activated" || status.startsWith("rejected_")
+        ? now
+        : undefined,
+    lastEvaluatedAt: now,
+    retiredAt: status === "retired" ? now : undefined,
+  });
+
+  return { queryCandidateId, created: true, ...canonical, status };
+}
+
+export async function upsertQueryPerformanceRecord(
+  db: MemoryDbWriter,
+  args: {
+    workspaceId: Id<"workspaces">;
+    queryId: Id<"keywords">;
+    canonicalValue: string;
+    canonicalHash: string;
+    platform?: "twitter" | "linkedin";
+    surface?: "posts" | "people";
+    activatedQueryCandidateId?: Id<"queryCandidates">;
+    impressionsDelta?: number;
+    prospectsFoundDelta?: number;
+    qualifiedCountDelta?: number;
+    convertedCountDelta?: number;
+    replyCountDelta?: number;
+    lastUsedAt?: number;
+    retiredAt?: number;
+  }
+) {
+  const workspace = await db.get(args.workspaceId);
+  if (!workspace) throw new Error("Workspace not found");
+  const targetingFingerprint = getLearningTargetingFingerprint(workspace);
+  const now = getCurrentUTCTimestamp();
+  const metricTimestamp = args.lastUsedAt ?? now;
+  const existing = await db
+    .query("queryPerformance")
+    .withIndex("by_workspace_query_id", (q) =>
+      q.eq("workspaceId", args.workspaceId).eq("queryId", args.queryId)
+    )
+    .first();
+
+  const previous =
+    existing && isCurrentTargetingLearning(existing, workspace)
+      ? existing
+      : undefined;
+  const impressions = Math.max(
+    0,
+    (previous?.impressions ?? 0) + (args.impressionsDelta ?? 0)
+  );
+  const prospectsFound = Math.max(
+    0,
+    (previous?.prospectsFound ?? 0) + (args.prospectsFoundDelta ?? 0)
+  );
+  const qualifiedCount = Math.max(
+    0,
+    (previous?.qualifiedCount ?? 0) + (args.qualifiedCountDelta ?? 0)
+  );
+  const convertedCount = Math.max(
+    0,
+    (previous?.convertedCount ?? 0) + (args.convertedCountDelta ?? 0)
+  );
+  const replyCount = Math.max(
+    0,
+    (previous?.replyCount ?? 0) + (args.replyCountDelta ?? 0)
+  );
+
+  const payload = {
+    targetingFingerprint,
+    canonicalValue: args.canonicalValue,
+    canonicalHash: args.canonicalHash,
+    platform: args.platform ?? previous?.platform,
+    surface: args.surface ?? previous?.surface,
+    activatedQueryCandidateId:
+      args.activatedQueryCandidateId ?? previous?.activatedQueryCandidateId,
+    impressions,
+    prospectsFound,
+    qualifiedCount,
+    convertedCount,
+    replyCount,
+    replyRate: calculateRate(replyCount, prospectsFound),
+    qualificationRate: calculateRate(qualifiedCount, prospectsFound),
+    lastUsedAt: args.lastUsedAt ?? previous?.lastUsedAt ?? now,
+    retiredAt: args.retiredAt ?? previous?.retiredAt,
+    updatedAt: now,
+  };
+  const performanceScore = calculateQueryPerformanceScore(payload);
+  const queryCandidateId =
+    args.activatedQueryCandidateId ?? previous?.activatedQueryCandidateId;
+
+  if (existing) {
+    await db.patch(existing._id, payload);
+    if (queryCandidateId) {
+      await db.patch(queryCandidateId, {
+        performanceScore,
+        updatedAt: now,
+      });
+    }
+    if (
+      typeof args.impressionsDelta === "number" ||
+      typeof args.prospectsFoundDelta === "number" ||
+      typeof args.qualifiedCountDelta === "number" ||
+      typeof args.convertedCountDelta === "number" ||
+      typeof args.replyCountDelta === "number"
+    ) {
+      const dayStartUtcMs = getUtcDayStartTimestamp(metricTimestamp);
+      const existingDaily = await db
+        .query("workspaceQueryPerformanceDaily")
+        .withIndex("by_workspace_query_day", (q) =>
+          q
+            .eq("workspaceId", args.workspaceId)
+            .eq("queryId", args.queryId)
+            .eq("dayStartUtcMs", dayStartUtcMs)
+        )
+        .first();
+      const nextDaily = mergeWorkspaceQueryPerformanceDailyDelta(
+        existingDaily,
+        {
+          workspaceId: args.workspaceId,
+          queryId: args.queryId,
+          activatedQueryCandidateId: queryCandidateId,
+          timestamp: metricTimestamp,
+          impressionsDelta: args.impressionsDelta,
+          prospectsFoundDelta: args.prospectsFoundDelta,
+          qualifiedCountDelta: args.qualifiedCountDelta,
+          convertedCountDelta: args.convertedCountDelta,
+          replyCountDelta: args.replyCountDelta,
+        }
+      );
+      if (isWorkspaceQueryPerformanceDailyRecordEmpty(nextDaily)) {
+        if (existingDaily) {
+          await db.delete(existingDaily._id);
+        }
+      } else if (existingDaily) {
+        await db.patch(existingDaily._id, nextDaily);
+      } else {
+        await db.insert("workspaceQueryPerformanceDaily", nextDaily);
+      }
+    }
+
+    return { queryPerformanceId: existing._id, created: false };
+  }
+
+  const queryPerformanceId = await db.insert("queryPerformance", {
+    workspaceId: args.workspaceId,
+    queryId: args.queryId,
+    ...payload,
+  });
+  if (queryCandidateId) {
+    await db.patch(queryCandidateId, {
+      performanceScore,
+      updatedAt: now,
+    });
+  }
+
+  if (
+    typeof args.impressionsDelta === "number" ||
+    typeof args.prospectsFoundDelta === "number" ||
+    typeof args.qualifiedCountDelta === "number" ||
+    typeof args.convertedCountDelta === "number" ||
+    typeof args.replyCountDelta === "number"
+  ) {
+    const nextDaily = mergeWorkspaceQueryPerformanceDailyDelta(null, {
+      workspaceId: args.workspaceId,
+      queryId: args.queryId,
+      activatedQueryCandidateId: queryCandidateId,
+      timestamp: metricTimestamp,
+      impressionsDelta: args.impressionsDelta,
+      prospectsFoundDelta: args.prospectsFoundDelta,
+      qualifiedCountDelta: args.qualifiedCountDelta,
+      convertedCountDelta: args.convertedCountDelta,
+      replyCountDelta: args.replyCountDelta,
+    });
+    if (!isWorkspaceQueryPerformanceDailyRecordEmpty(nextDaily)) {
+      await db.insert("workspaceQueryPerformanceDaily", nextDaily);
+    }
+  }
+
+  return { queryPerformanceId, created: true };
+}
+
+export async function recordMemoryWorkflowEventRecord(
+  db: MemoryDbWriter,
+  args: {
+    workspaceId: Id<"workspaces">;
+    eventType: Doc<"memoryWorkflowEvents">["eventType"];
+    sourceType: Doc<"memoryWorkflowEvents">["sourceType"];
+    sourceId: string;
+    workflowName?: string;
+    status?: Doc<"memoryWorkflowEvents">["status"];
+    prospectId?: Id<"prospects">;
+    planId?: Id<"outreachPlans">;
+    taskId?: Id<"outreachTasks">;
+    queryCandidateId?: Id<"queryCandidates">;
+    queryId?: Id<"keywords">;
+    payload?: Doc<"memoryWorkflowEvents">["payload"];
+    eventKey?: string;
+    occurredAt?: number;
+  }
+) {
+  const workspace = await db.get(args.workspaceId);
+  if (!workspace) throw new Error("Workspace not found");
+  const occurredAt = args.occurredAt ?? getCurrentUTCTimestamp();
+  const nextStatus = resolveDefaultMemoryWorkflowEventStatus({
+    eventType: args.eventType,
+    explicitStatus: args.status,
+  });
+  const eventKey =
+    args.eventKey ??
+    buildMemoryWorkflowEventKey([
+      args.eventType,
+      args.workspaceId,
+      args.sourceType,
+      args.sourceId,
+      args.queryId,
+      args.queryCandidateId,
+      args.taskId,
+      args.planId,
+    ]);
+  const existing = await db
+    .query("memoryWorkflowEvents")
+    .withIndex("by_event_key", (q) => q.eq("eventKey", eventKey))
+    .first();
+
+  if (existing) {
+    await db.patch(existing._id, {
+      status: args.status ?? existing.status,
+      workflowName: args.workflowName ?? existing.workflowName,
+      payload: args.payload ?? existing.payload,
+      occurredAt,
+      error: undefined,
+      processedAt:
+        (args.status ?? existing.status) === "processed" ||
+        (args.status ?? existing.status) === "ignored"
+          ? getCurrentUTCTimestamp()
+          : existing.processedAt,
+    });
+    return {
+      eventId: existing._id,
+      created: false,
+      eventKey,
+      status: args.status ?? existing.status,
+    };
+  }
+
+  const sourceProspect = args.prospectId ? await db.get(args.prospectId) : null;
+  const sourceQuery = args.queryId ? await db.get(args.queryId) : null;
+  if (sourceProspect && sourceProspect.workspaceId !== args.workspaceId)
+    throw new Error("Memory event prospect workspace mismatch");
+  if (sourceQuery && sourceQuery.workspaceId !== args.workspaceId)
+    throw new Error("Memory event query workspace mismatch");
+  const explicitFingerprint = getStringProperty(
+    isRecord(args.payload) ? args.payload : undefined,
+    "targetingFingerprint"
+  );
+  // Delayed enrichment/outreach feedback belongs to the decision that selected
+  // its source prospect, not whichever audience happens to be current today.
+  const targetingFingerprint =
+    explicitFingerprint ??
+    (sourceProspect
+      ? (sourceProspect.qualificationTargetingFingerprint ??
+        (workspace.targetingLearningResetAt === undefined
+          ? getLearningTargetingFingerprint(workspace)
+          : undefined))
+      : sourceQuery
+        ? sourceQuery.targetingFingerprint
+        : getLearningTargetingFingerprint(workspace));
+  const eventId = await db.insert("memoryWorkflowEvents", {
+    workspaceId: args.workspaceId,
+    targetingFingerprint,
+    eventType: args.eventType,
+    status: nextStatus,
+    sourceType: args.sourceType,
+    sourceId: args.sourceId,
+    eventKey,
+    workflowName: args.workflowName,
+    prospectId: args.prospectId,
+    planId: args.planId,
+    taskId: args.taskId,
+    queryCandidateId: args.queryCandidateId,
+    queryId: args.queryId,
+    payload: args.payload,
+    occurredAt,
+    processedAt:
+      nextStatus === "processed" || nextStatus === "ignored"
+        ? getCurrentUTCTimestamp()
+        : undefined,
+    evaluatorWorkflowId: undefined,
+    error: undefined,
+  });
+
+  return { eventId, created: true, eventKey, status: nextStatus };
+}
+
+export async function recordMemoryWorkflowEvent(
+  ctx: Pick<MutationCtx, "db" | "scheduler">,
+  args: {
+    workspaceId: Id<"workspaces">;
+    eventType: Doc<"memoryWorkflowEvents">["eventType"];
+    sourceType: Doc<"memoryWorkflowEvents">["sourceType"];
+    sourceId: string;
+    workflowName?: string;
+    status?: Doc<"memoryWorkflowEvents">["status"];
+    prospectId?: Id<"prospects">;
+    planId?: Id<"outreachPlans">;
+    taskId?: Id<"outreachTasks">;
+    queryCandidateId?: Id<"queryCandidates">;
+    queryId?: Id<"keywords">;
+    payload?: Doc<"memoryWorkflowEvents">["payload"];
+    eventKey?: string;
+    occurredAt?: number;
+  }
+) {
+  const result = await recordMemoryWorkflowEventRecord(ctx.db, args);
+  if (
+    result.status === "pending" &&
+    isEvaluatorRelevantEventType(args.eventType)
+  ) {
+    await ctx.scheduler.runAfter(
+      0,
+      internal.workflows.memory.enqueueWorkspaceMemoryEvaluationInternal,
+      { workspaceId: args.workspaceId }
+    );
+  }
+  return result;
+}

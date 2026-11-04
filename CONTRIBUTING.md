@@ -1,0 +1,261 @@
+# Contributing to ReacherX
+
+Thanks for wanting to contribute.
+
+ReacherX is an open-source agent product focused on finding the right people, building context around them, and helping users take action through the UI or through the agent itself. If you want to improve the product, fix something broken, or help shape the roadmap, you are in the right place.
+
+ReacherX is part of the [Convex for Open Source](https://www.convex.dev/open-source-program) program. Learn more about Convex at [convex.link/coss](https://convex.link/coss).
+
+[README](./README.md) · [Configuration](./docs/configuration.md) · [Roadmap](./ROADMAP.md) · [GitHub Issues](https://github.com/VecterAI/reacher-x/issues) · [Discord](https://discord.gg/BQttyr8jY) · [X/Twitter](https://x.com/ReacherXfounder)
+
+Supporting repo policies:
+
+- [Code of Conduct](./CODE_OF_CONDUCT.md)
+- [Security Policy](./SECURITY.md)
+
+## Before you start
+
+Please talk to me before working on:
+
+- new features
+- roadmap items
+- major UX changes
+- agent behavior changes
+- architecture changes
+- integration work
+
+That is important here because feature work usually benefits from brainstorming first.
+
+Reach out here:
+
+- Discord: [discord.gg/BQttyr8jY](https://discord.gg/BQttyr8jY)
+- X/Twitter DM: [@ReacherXfounder](https://x.com/ReacherXfounder)
+- GitHub Issues: [github.com/VecterAI/reacher-x/issues](https://github.com/VecterAI/reacher-x/issues)
+
+Small bug fixes, typo fixes, and focused polish PRs are fine without a long pre-discussion.
+
+## Fastest ways to help
+
+- Fix docs that are unclear or outdated.
+- Improve accessibility and responsive behavior.
+- Tighten loading states, empty states, and error states.
+- Add or improve tests.
+- Improve local setup and contributor onboarding.
+- Work on a roadmap item after checking in first.
+
+## Local setup
+
+Use Node.js 22+ with pnpm 11.x. The repo is pinned to pnpm 11 in `package.json`, so Corepack is the simplest way to stay aligned.
+
+Contributors do not have push access to the main repo, so start by forking it on GitHub. Clone your fork and add the main repo as a second remote so you can stay in sync:
+
+```bash
+# 1. Fork https://github.com/VecterAI/reacher-x on GitHub, then clone your fork:
+git clone https://github.com/YOUR-USERNAME/reacher-x.git
+cd reacher-x
+
+# 2. Add the main repo as upstream:
+git remote add upstream https://github.com/VecterAI/reacher-x.git
+git fetch upstream
+
+corepack enable pnpm
+pnpm install
+cp .env.example .env.local
+npx convex dev --once
+```
+
+If you are self-hosting instead of contributing, the direct clone in the [README](./README.md#self-hosting) is the right way.
+
+After the one-time Convex validation succeeds, run the development processes in separate terminals:
+
+```bash
+# Terminal 1: Convex backend watcher
+npx convex dev
+```
+
+```bash
+# Terminal 2: Next.js frontend
+pnpm dev
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+## Environment expectations
+
+Use `.env.example` as the local template and follow [docs/configuration.md](./docs/configuration.md) for the complete setup. Next.js reads `.env.local`, while Convex backend variables are configured per deployment with `npx convex env set`.
+
+Depending on what you work on, you may need:
+
+- Convex configuration
+- WorkOS configuration
+- AI provider keys
+- X/Twitter credentials
+- LinkedIn provider credentials
+- Email provider configuration
+- Billing configuration
+
+You only need the provider credentials for the feature area you are developing. Do not upload the whole `.env.local` file to Convex. It contains frontend and local-only values as well as secrets intended for other runtimes.
+
+## How the codebase is organized
+
+- `app/`: route structure and page-level entry points.
+- `features/`: product features and UI modules.
+- `shared/`: shared UI, hooks, types, and utilities.
+- `convex/agents/tools/`: thin tool wrappers exposed to agents.
+- `convex/workflows/`: orchestration, retries, durable flows.
+- `convex/lib/`: core business logic and reusable backend helpers.
+
+## Core repo rules
+
+Read [`agents.md`](./agents.md) before making architectural assumptions.
+
+Important rules:
+
+- Search for existing helpers before adding new ones.
+- Reuse shared utilities instead of creating one-off logic.
+- Follow the 3-layer Convex architecture.
+- `convex/agents/tools/` for thin tool wrappers
+- `convex/workflows/` for orchestration
+- `convex/lib/*Core.ts` for business logic
+- Keep agent tools thin.
+- Use the existing validators, type guards, and helper patterns when available.
+
+## Best contribution paths
+
+### Frontend
+
+- loading states
+- accessibility
+- responsive behavior
+- profile panel improvements
+- composer experience
+- discoverability and clarity in the UI
+
+### Backend
+
+- workflow reliability
+- platform integrations
+- queueing and retry behavior
+- data contracts
+- webhook robustness
+
+### Agent and AI
+
+- prompt and tool UX improvements
+- evaluations and benchmark coverage
+- memory quality
+- plan quality
+- guardrails and review flows
+
+### Product infrastructure
+
+- local-dev ergonomics
+- docs quality
+- email delivery flows
+- observability and diagnostics
+
+## Roadmap and help wanted
+
+The active roadmap lives in [ROADMAP.md](./ROADMAP.md).
+
+Especially valuable areas:
+
+- Email integration so users can send emails directly from ReacherX through the UI or through the agent.
+- Calendar integration for Google Calendar and Outlook Calendar so users can book meetings manually in the UI or by asking the agent.
+- Cross-platform identity resolution so a single prospect can be seen across multiple social channels in the profile panel.
+- Additional platforms such as Reddit, Bluesky, and Threads.
+- Evaluations, benchmarks, and performance measurement for agent quality.
+- Sub-agents and agent swarms for parallel task execution.
+- PDF, document, spreadsheet, and presentation extraction for richer agent workflows. Image, GIF, and video attachments are already supported.
+- Reliability and optimization work using tools such as React Doctor, Convex tooling, linting, audits, and stronger automated testing.
+
+If you want to work on any of the items above, please talk to me first so we can align on approach and product intent.
+
+## How to propose work
+
+### Small changes
+
+For typo fixes, targeted bug fixes, and small polish improvements:
+
+- open a PR directly, or
+- open a quick issue first if you want feedback before implementing
+
+### Bigger changes
+
+For features, roadmap items, integrations, or architectural work:
+
+- open an issue, and
+- message me on Discord or X/Twitter so we can brainstorm before implementation
+
+## Submitting changes
+
+Work on a branch, never directly on `main`:
+
+```bash
+# start from the latest main
+git fetch upstream
+git switch main
+git merge --ff-only upstream/main
+
+# create a branch
+git switch -c fix/short-description
+
+# ...make your changes and commit...
+```
+
+Push the branch to your fork and open a pull request against `VecterAI/reacher-x:main`:
+
+```bash
+git push origin fix/short-description
+```
+
+GitHub shows a "Compare & pull request" button after you push, or open one from the [pull requests page](https://github.com/VecterAI/reacher-x/pulls). Use the PR template that appears when you open it.
+
+To keep your fork up to date over time:
+
+```bash
+git fetch upstream
+git switch main
+git merge --ff-only upstream/main
+git push origin main
+```
+
+Keep one PR focused on one change. If `main` has moved and your PR conflicts, rebase your branch on `upstream/main`, then run `git push --force-with-lease origin fix/short-description`.
+
+CI runs on every pull request and checks types, lint, formatting on the changed files, and the Convex tests. Run the same checks locally before opening the PR so it goes green on the first push.
+
+## PR checklist
+
+Before opening a PR:
+
+- explain what changed
+- explain why it changed
+- mention any env var, schema, or integration impact
+- include screenshots for UI changes
+- run the checks that apply
+
+Useful commands:
+
+```bash
+pnpm exec tsc --noEmit
+pnpm lint:strict
+pnpm exec prettier --check path/to/changed-file
+pnpm test:convex
+pnpm build
+```
+
+Run the focused test commands that cover your change as well. Keep editor/LSP diagnostics clean for every touched code file.
+
+CI must pass on your PR before it can be merged.
+
+## Where to ask questions
+
+- Discord: [discord.gg/BQttyr8jY](https://discord.gg/BQttyr8jY)
+- X/Twitter DM: [@ReacherXfounder](https://x.com/ReacherXfounder)
+- GitHub Issues: [github.com/VecterAI/reacher-x/issues](https://github.com/VecterAI/reacher-x/issues)
+
+For anything roadmap-related, feature-related, or exploratory, Discord or X/Twitter is preferred.
+
+## License for contributions
+
+ReacherX is licensed under [AGPL-3.0](./LICENSE). By contributing code, documentation, or other material to this repository, you agree that your contributions are licensed under AGPL-3.0. This keeps every improvement open for the community.

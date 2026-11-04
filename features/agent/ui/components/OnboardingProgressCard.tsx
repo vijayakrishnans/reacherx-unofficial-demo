@@ -1,0 +1,482 @@
+"use client";
+
+import { useRouter } from "next/navigation";
+import {
+  getRunningWorkspaceStatusCopy,
+  getRecoveringWorkspaceStatusCopy,
+} from "@/shared/lib/workspaceStatusCopyHelpers";
+import { getWorkspaceDiscoveryVerb } from "@/shared/lib/workspaceUseCases";
+import { CloseIcon } from "@/shared/ui/components/icons";
+import { api } from "@/convex/_generated/api";
+import type { Id } from "@/convex/_generated/dataModel";
+import { useActiveUseCaseLabels, useQueryWithStatus } from "@/shared/hooks";
+import AnimatedNumber from "@/shared/ui/components/AnimatedNumber";
+import { AnimatedElapsedTimer } from "@/shared/ui/components/AnimatedElapsedTimer";
+import { AsciiSpinnerText } from "@/shared/ui/components/AsciiSpinnerText";
+import {
+  Timeline,
+  TimelineDate,
+  TimelineHeader,
+  TimelineIndicator,
+  TimelineItem,
+  TimelineSeparator,
+  TimelineTitle,
+} from "@/shared/ui/components/Timeline";
+import { Button } from "@/shared/ui/components/Button";
+import {
+  Card,
+  CardContent,
+  CardFooter,
+  CardHeader,
+} from "@/shared/ui/components/Card";
+import {
+  cn,
+  formatTimestampInTimezone,
+  getCurrentUTCTimestamp,
+  isSameDay,
+} from "@/shared/lib/utils";
+import { formatProspectPlatformSummary } from "@/shared/lib/platforms/prospectPlatformSummary";
+import {
+  formatAverageFitScoreDetail,
+  formatEnrichedProfilesDetail,
+} from "@/shared/lib/workspaceProgressDetails";
+
+const STAGES = [
+  { id: "searching", label: "Search", step: 1 },
+  { id: "qualifying", label: "Check match", step: 2 },
+  { id: "enriching", label: "Find details", step: 3 },
+  { id: "plans", label: "Plans", step: 4 },
+] as const;
+
+type OnboardingProgressData = {
+  found: number;
+  twitterProspectsCount: number;
+  linkedInProspectsCount: number;
+  qualified: number;
+  enriched: number;
+  plansGenerated: number;
+  avgQualificationScore: number;
+  actionableReadyCount: number;
+  readyQualifiedEnrichedCount: number;
+  workflowStatus: "running" | "paused" | "stopped" | "limit_reached";
+  pauseReason: string | null;
+  isResumable: boolean;
+  systemMode: "running" | "degraded" | "paused" | "attention";
+  userVisibleIssueState: {
+    status: string;
+    message: string;
+  } | null;
+  pipelineStartedAt: number | null;
+  pausedAt: number | null;
+  nextRunAt: number | null;
+  phase: "searching" | "qualifying" | "enriching" | "planning" | "done";
+  isDone: boolean;
+};
+
+export type OnboardingProgressPreviewData = {
+  found: number;
+  twitterProspectsCount: number;
+  linkedInProspectsCount: number;
+  qualified: number;
+  enriched: number;
+  plansGenerated?: number;
+  avgQualificationScore?: number;
+  actionableReadyCount: number;
+  readyQualifiedEnrichedCount?: number;
+  pipelineStartedAt: number | null;
+  phase?: OnboardingProgressData["phase"];
+  isDone?: boolean;
+};
+
+interface OnboardingProgressCardProps {
+  /** Real workspace. Omit when `previewData` is provided. */
+  workspaceId?: string;
+  displayMode?: "running" | "degraded" | "paused" | "attention";
+  footerMode?: "default" | "hidden" | "resume" | "action";
+  footerActionLabel?: string;
+  footerActionDisabled?: boolean;
+  onFooterAction?: () => void | Promise<void>;
+  headlineOverride?: string | null;
+  metaLabelOverride?: string | null;
+  /** Override “View {entities}” label (e.g. mock use-case terminology). */
+  viewEntitiesLabel?: string;
+  timerMode?: "elapsed" | "paused" | "hidden";
+  onClose?: () => void;
+  className?: string;
+  /** Prop-driven progress for mocks without a live workspace query. */
+  previewData?: OnboardingProgressPreviewData;
+}
+
+const DEFAULT_PROGRESS_DATA: OnboardingProgressData = {
+  found: 0,
+  twitterProspectsCount: 0,
+  linkedInProspectsCount: 0,
+  qualified: 0,
+  enriched: 0,
+  plansGenerated: 0,
+  avgQualificationScore: 0,
+  actionableReadyCount: 0,
+  readyQualifiedEnrichedCount: 0,
+  workflowStatus: "stopped" as const,
+  pauseReason: null,
+  isResumable: false,
+  systemMode: "running" as const,
+  userVisibleIssueState: null,
+  pipelineStartedAt: null,
+  pausedAt: null,
+  nextRunAt: null,
+  phase: "searching" as const,
+  isDone: false,
+};
+
+function formatNextRunLabel(nextRunAt: number): string {
+  const formatString = isSameDay(getCurrentUTCTimestamp(), nextRunAt)
+    ? "h:mm a"
+    : "MMM d · h:mm a";
+
+  return `Next run at ${formatTimestampInTimezone(nextRunAt, formatString)}`;
+}
+
+function getTimelineStep(data: {
+  found: number;
+  qualified: number;
+  enriched: number;
+  plansGenerated: number;
+  isDone: boolean;
+}): number {
+  if (data.plansGenerated > 0 || data.isDone) return 4;
+  if (data.enriched > 0) return 3;
+  if (data.qualified > 0) return 2;
+  if (data.found > 0) return 1;
+  return 0;
+}
+
+function getStageCount(
+  stageId: string,
+  data: {
+    found: number;
+    qualified: number;
+    enriched: number;
+    plansGenerated: number;
+  }
+): number {
+  switch (stageId) {
+    case "searching":
+      return data.found;
+    case "qualifying":
+      return data.qualified;
+    case "enriching":
+      return data.enriched;
+    case "plans":
+      return data.plansGenerated;
+    default:
+      return 0;
+  }
+}
+
+export function OnboardingProgressCard({
+  workspaceId,
+  displayMode = "running",
+  footerMode = "default",
+  footerActionLabel,
+  footerActionDisabled = false,
+  onFooterAction,
+  headlineOverride,
+  metaLabelOverride,
+  viewEntitiesLabel,
+  timerMode = "elapsed",
+  onClose,
+  className,
+  previewData,
+}: OnboardingProgressCardProps) {
+  const router = useRouter();
+  const { activeUseCase, pageLabels } = useActiveUseCaseLabels();
+
+  const dataQuery = useQueryWithStatus(
+    api.prospects.getOnboardingProgress,
+    previewData || !workspaceId
+      ? "skip"
+      : { workspaceId: workspaceId as Id<"workspaces"> }
+  );
+  const data: OnboardingProgressData = previewData
+    ? {
+        ...DEFAULT_PROGRESS_DATA,
+        found: previewData.found,
+        twitterProspectsCount: previewData.twitterProspectsCount,
+        linkedInProspectsCount: previewData.linkedInProspectsCount,
+        qualified: previewData.qualified,
+        enriched: previewData.enriched,
+        plansGenerated: previewData.plansGenerated ?? 0,
+        avgQualificationScore: previewData.avgQualificationScore ?? 0,
+        actionableReadyCount: previewData.actionableReadyCount,
+        readyQualifiedEnrichedCount:
+          previewData.readyQualifiedEnrichedCount ??
+          previewData.actionableReadyCount,
+        pipelineStartedAt: previewData.pipelineStartedAt,
+        workflowStatus: "running",
+        systemMode: "running",
+        phase: previewData.phase ?? "qualifying",
+        isDone: previewData.isDone ?? false,
+      }
+    : ((dataQuery.data as OnboardingProgressData | undefined) ??
+      DEFAULT_PROGRESS_DATA);
+
+  const pipelineStartedAt = data?.pipelineStartedAt ?? null;
+  const pausedAt = data?.pausedAt ?? null;
+  const nextRunAt = data?.nextRunAt ?? null;
+  const readyCount =
+    data?.actionableReadyCount ?? data?.readyQualifiedEnrichedCount ?? 0;
+  const isReady = readyCount > 0;
+  const entitiesLabel = (
+    viewEntitiesLabel ?? pageLabels.entities
+  ).toLowerCase();
+  const timelineStep = data ? getTimelineStep(data) : 0;
+  const nextRunLabel = nextRunAt ? formatNextRunLabel(nextRunAt) : null;
+
+  const handleViewProspects = () => {
+    router.push("/");
+  };
+
+  if (!previewData && dataQuery.isError) {
+    return (
+      <Card className="p-4 shadow-none">
+        <p className="text-sm font-medium">Could not load setup progress</p>
+        <p className="text-muted-foreground mt-1 text-sm">
+          {dataQuery.error.message || "Please try again."}
+        </p>
+      </Card>
+    );
+  }
+
+  const resolvedMode = previewData ? displayMode : data.systemMode;
+  const isStarting =
+    !previewData && !data.pipelineStartedAt && resolvedMode === "running";
+  const headerMessage =
+    headlineOverride ??
+    (resolvedMode === "paused"
+      ? "△ Agent is paused."
+      : resolvedMode === "attention"
+        ? data.userVisibleIssueState?.message || "△ Agent needs attention."
+        : resolvedMode === "degraded"
+          ? getRecoveringWorkspaceStatusCopy({
+              entityPlural: activeUseCase.entityPlural,
+              useCaseName: activeUseCase.displayName,
+            }).title
+          : isStarting
+            ? "△ Agent is starting."
+            : getRunningWorkspaceStatusCopy({
+                discoveryVerb: getWorkspaceDiscoveryVerb(activeUseCase.key),
+                entityPlural: activeUseCase.entityPlural,
+                useCaseName: activeUseCase.displayName,
+              }).title);
+  const headerMetaLabel =
+    metaLabelOverride ??
+    (resolvedMode === "running"
+      ? `${activeUseCase.displayName} pipeline`
+      : resolvedMode === "degraded"
+        ? `${activeUseCase.displayName} recovering`
+        : resolvedMode === "paused"
+          ? `${activeUseCase.displayName} paused`
+          : "Action required");
+  const showRecoveringStatus =
+    resolvedMode === "degraded" && pipelineStartedAt !== null;
+  const showElapsedTimer =
+    (previewData
+      ? timerMode
+      : resolvedMode === "paused"
+        ? "paused"
+        : "elapsed") === "elapsed" &&
+    !nextRunLabel &&
+    !showRecoveringStatus;
+  const showPausedTimer =
+    (previewData
+      ? timerMode
+      : resolvedMode === "paused"
+        ? "paused"
+        : "elapsed") === "paused";
+
+  return (
+    <Card className={cn("w-full shadow-none", className)}>
+      <CardHeader className="gap-3 border-b px-4 py-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="text-sm leading-6 font-medium">
+              {headlineOverride ? (
+                <span className="text-muted-foreground">{headerMessage}</span>
+              ) : isStarting ? (
+                <AsciiSpinnerText
+                  text={headerMessage}
+                  variant="spinner"
+                  className="text-foreground"
+                />
+              ) : (
+                <span
+                  className={
+                    isReady ? "text-foreground" : "text-muted-foreground"
+                  }
+                >
+                  {headerMessage}
+                </span>
+              )}
+            </div>
+          </div>
+          {onClose ? (
+            <Button
+              variant="ghost"
+              size="xsIcon"
+              className="text-muted-foreground hover:text-foreground -mr-1 shrink-0 rounded-full"
+              onClick={onClose}
+              aria-label="Close dialog"
+            >
+              <CloseIcon className="size-4 fill-current" />
+            </Button>
+          ) : isStarting ? (
+            <div className="w-8 shrink-0" />
+          ) : null}
+        </div>
+        <div className="flex min-h-4 flex-wrap items-center justify-between gap-3">
+          <span className="text-muted-foreground text-xs">
+            {headerMetaLabel}
+          </span>
+          {showElapsedTimer ? (
+            <AnimatedElapsedTimer
+              startedAt={pipelineStartedAt}
+              className="text-muted-foreground text-xs"
+            />
+          ) : showPausedTimer ? (
+            <AnimatedElapsedTimer
+              startedAt={pipelineStartedAt}
+              pausedAt={pausedAt}
+              prefix="Paused"
+              className="text-muted-foreground text-xs"
+            />
+          ) : showRecoveringStatus || nextRunLabel ? (
+            <div className="text-muted-foreground flex flex-wrap items-center gap-1 text-xs">
+              {showRecoveringStatus ? (
+                <AnimatedElapsedTimer
+                  startedAt={pipelineStartedAt}
+                  prefix="Recovering"
+                  className="text-xs"
+                />
+              ) : null}
+              {showRecoveringStatus && nextRunLabel ? <span>·</span> : null}
+              {nextRunLabel ? <span>{nextRunLabel}</span> : null}
+            </div>
+          ) : null}
+        </div>
+      </CardHeader>
+
+      <CardContent className="grid grid-cols-3 divide-x border-b p-0">
+        <StatCell
+          label="Found"
+          value={data.found}
+          detail={
+            formatProspectPlatformSummary({
+              twitterProspectsCount: data.twitterProspectsCount,
+              linkedInProspectsCount: data.linkedInProspectsCount,
+            }) ?? "\u00A0"
+          }
+        />
+        <StatCell
+          label="Good match"
+          value={data.qualified}
+          detail={
+            formatAverageFitScoreDetail(data.avgQualificationScore) ?? "\u00A0"
+          }
+        />
+        <StatCell
+          label="Ready"
+          value={data.enriched}
+          detail={formatEnrichedProfilesDetail(data.enriched)}
+        />
+      </CardContent>
+
+      <CardContent className="px-4 py-3">
+        <Timeline defaultValue={timelineStep} orientation="horizontal">
+          {STAGES.map((stage) => {
+            const count = getStageCount(stage.id, data);
+            return (
+              <TimelineItem
+                key={stage.id}
+                step={stage.step}
+                className="min-w-[72px] flex-1 group-data-[orientation=horizontal]/timeline:mt-0"
+              >
+                <TimelineHeader>
+                  <TimelineSeparator className="group-data-[orientation=horizontal]/timeline:top-7" />
+                  <TimelineDate
+                    className={cn(
+                      "mb-8 font-mono text-[10px] tabular-nums",
+                      count > 0 ? "text-foreground" : "text-muted-foreground/50"
+                    )}
+                  >
+                    {count > 0 ? (
+                      <AnimatedNumber value={count} />
+                    ) : (
+                      <span>-</span>
+                    )}
+                  </TimelineDate>
+                  <TimelineTitle className="text-[11px]">
+                    {stage.label}
+                  </TimelineTitle>
+                  <TimelineIndicator className="group-data-[orientation=horizontal]/timeline:top-7" />
+                </TimelineHeader>
+              </TimelineItem>
+            );
+          })}
+        </Timeline>
+      </CardContent>
+
+      {footerMode !== "hidden" ? (
+        <CardFooter className="border-t px-4 py-3">
+          {footerMode === "default" ? (
+            isReady ? (
+              <Button
+                variant="default"
+                size="xs"
+                className="w-full"
+                onClick={onFooterAction ?? handleViewProspects}
+              >
+                View {entitiesLabel}
+              </Button>
+            ) : (
+              <Button variant="outline" size="xs" className="w-full" disabled>
+                Setup in progress...
+              </Button>
+            )
+          ) : (
+            <Button
+              variant="default"
+              size="xs"
+              className="w-full"
+              onClick={() => void onFooterAction?.()}
+              disabled={footerActionDisabled || !onFooterAction}
+            >
+              {footerActionLabel ??
+                (footerMode === "resume" ? "Resume △ Agent" : "Continue")}
+            </Button>
+          )}
+        </CardFooter>
+      ) : null}
+    </Card>
+  );
+}
+
+function StatCell({
+  label,
+  value,
+  detail,
+}: {
+  label: string;
+  value: number;
+  detail: string;
+}) {
+  return (
+    <article className="px-4 py-2.5">
+      <p className="text-muted-foreground text-[10px] font-medium">{label}</p>
+      <p className="text-foreground mt-0.5 font-mono text-lg tabular-nums">
+        <AnimatedNumber value={value} animateOnMount />
+      </p>
+      <p className="text-muted-foreground mt-0.5 text-[11px]">{detail}</p>
+    </article>
+  );
+}

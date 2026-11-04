@@ -1,0 +1,63 @@
+"use client";
+
+import { useAnimationActivity } from "@/shared/contexts/AnimationActivityProvider";
+
+import { useEffect, useState } from "react";
+
+type SpinnerVariant = "spinner" | "clock" | "ascii";
+
+const VARIANT_FRAMES: Record<SpinnerVariant, readonly string[]> = {
+  spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+  clock: ["◴", "◷", "◶", "◵"],
+  ascii: ["|", "/", "-", "\\"],
+};
+
+const VARIANT_DEFAULT_INTERVAL: Record<SpinnerVariant, number> = {
+  spinner: 40,
+  clock: 250,
+  ascii: 120,
+};
+
+export function AsciiSpinnerText({
+  text,
+  variant = "spinner",
+  intervalMs,
+  className,
+}: {
+  text?: string;
+  variant?: SpinnerVariant;
+  intervalMs?: number;
+  className?: string;
+}) {
+  const active = useAnimationActivity();
+  const frames = VARIANT_FRAMES[variant];
+  const interval = intervalMs ?? VARIANT_DEFAULT_INTERVAL[variant];
+  const [frame, setFrame] = useState(0);
+
+  useEffect(() => {
+    if (!active) return;
+    const id = window.setInterval(() => {
+      setFrame((f) => (f + 1) % frames.length);
+    }, interval);
+    return () => window.clearInterval(id);
+  }, [active, interval, frames.length]);
+
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      className={className}
+      title={text ?? "Loading"}
+    >
+      <span className="inline-block w-[1em] select-none" aria-hidden>
+        {frames[frame]}
+      </span>
+      {text ? (
+        <>
+          {" "}
+          <span>{text}</span>
+        </>
+      ) : null}
+    </span>
+  );
+}

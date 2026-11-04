@@ -1,0 +1,132 @@
+"use client";
+
+import { MARKETING_COPY } from "@/features/landing/lib/marketingContentHelpers";
+
+import Link from "next/link";
+import { ArrowOutwardIcon, FireCheckIcon } from "@/shared/ui/components/icons";
+import { LandingPrimaryCta } from "../LandingPrimaryCta";
+import { marketingButton as buttonVariants } from "./MarketingLayout";
+import {
+  highlightTerms,
+  MarketingFeature,
+  MarketingSection,
+} from "./MarketingLayout";
+import { LandingBookDemoCta } from "../LandingBookDemoCta";
+import { MarketingDemo } from "./MarketingDemo";
+import { ScrollFillNarrative } from "./ScrollFillNarrative";
+
+export function MarketingWorkflow() {
+  return (
+    <>
+      <MarketingFeature
+        id="how-it-works"
+        title="Describe the people you want to reach."
+        demo={
+          <MarketingDemo
+            scenario="find-potential-customers"
+            sceneRange={[0, 12]}
+            title="Set up a search by talking to ReacherX"
+            caption="The setup conversation, from your goal to the people who fit."
+          />
+        }
+      >
+        <p className="text-lg leading-7 text-pretty">
+          {MARKETING_COPY.workflow.setup}
+        </p>
+        <Link
+          href="/blog/getting-started-with-reacherx"
+          className={buttonVariants({ variant: "outline", className: "mt-8" })}
+        >
+          See the setup guide
+          <ArrowOutwardIcon className="size-4 shrink-0 fill-current" />
+        </Link>
+      </MarketingFeature>
+      <MarketingFeature
+        reverse
+        title={
+          <>
+            See every{" "}
+            <FireCheckIcon
+              className="inline size-[0.72em] align-[-0.06em]"
+              aria-hidden="true"
+            />{" "}
+            match, and why.
+          </>
+        }
+        demo={
+          <MarketingDemo
+            scenario="find-potential-customers"
+            sceneRange={[13, 20]}
+            title="Research the designers who fit"
+            caption="Search results with the evidence behind each match."
+          />
+        }
+      >
+        <p className="text-lg leading-7 text-pretty">
+          {MARKETING_COPY.workflow.research}
+        </p>
+        <Link
+          href="/blog/how-reacherx-qualification-works"
+          className={buttonVariants({ variant: "outline", className: "mt-8" })}
+        >
+          How qualification works
+          <ArrowOutwardIcon className="size-4 shrink-0 fill-current" />
+        </Link>
+      </MarketingFeature>
+      <MarketingFeature
+        title="Outreach that sounds like you."
+        demo={
+          <MarketingDemo
+            scenario="find-potential-customers"
+            sceneRange={[23, 41]}
+            title="Review an introduction and follow the reply"
+            caption="A personal introduction for each person, ready for your review."
+          />
+        }
+      >
+        <p className="text-lg leading-7 text-pretty">
+          {MARKETING_COPY.workflow.outreach}
+        </p>
+        <p className="text-lg leading-7 text-pretty">
+          {highlightTerms(MARKETING_COPY.workflow.outreachLimits, [
+            "safe, human-like limits",
+          ])}
+        </p>
+        <Link
+          href="/blog/what-reacherx-does-automatically"
+          className={buttonVariants({ variant: "outline", className: "mt-8" })}
+        >
+          See the automation controls
+          <ArrowOutwardIcon className="size-4 shrink-0 fill-current" />
+        </Link>
+      </MarketingFeature>
+    </>
+  );
+}
+
+/**
+ * Hero-follow narrative (US Mobile-style scroll fill). Replaces the old
+ * "one subscription" strikethrough headline with a clear statement of the
+ * four pillars: discovery, CRM, rich outreach, and baked-in social.
+ */
+export function MarketingNarrative() {
+  return <ScrollFillNarrative paragraphs={MARKETING_COPY.narrative} />;
+}
+
+export function MarketingFinish() {
+  return (
+    <MarketingSection className="pt-8 pb-24 lg:pt-12 lg:pb-32">
+      <div className="flex flex-col justify-between gap-8 sm:flex-row sm:items-center">
+        <div>
+          <h2 className="text-3xl leading-tight font-normal tracking-tight sm:text-4xl">
+            {MARKETING_COPY.workflow.finishHeading}
+          </h2>
+        </div>
+        <div className="grid w-full grid-cols-2 gap-3 sm:flex sm:w-auto">
+          <LandingPrimaryCta size="lg" />
+          <LandingBookDemoCta variant="outline" size="lg" />
+        </div>
+      </div>
+    </MarketingSection>
+  );
+}

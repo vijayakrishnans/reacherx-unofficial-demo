@@ -1,0 +1,50 @@
+apiVersion: sourceplane.io/v1
+kind: Component
+metadata:
+  name: web
+  description: Unofficial demo of ReacherX on Cloudflare Workers + Static Assets, built with OpenNext.
+spec:
+  type: cloudflare-workers-assets-turbo
+  lifecycle: production
+  owner: platform
+  domain: app
+  # The repository root: the demo imports the whole product tree, and root
+  # holds the lockfile, package.json and the wrangler binary.
+  path: .
+  lane: isolated
+  subscribe:
+    environments:
+      - name: dev
+        profile: verify
+      - name: stage
+        profile: verify
+        profileRules:
+          - profile: deploy
+            when:
+              triggerRef: github-push-main
+      - name: prod
+        profile: verify
+        profileRules:
+          - profile: deploy
+            when:
+              triggerRef: github-push-main
+  parameters:
+    nodeVersion: "22"
+    pnpmVersion: "11.7.0"
+    workspaceDir: .
+    appDir: demos/app
+    turboFilter: reacher-x
+    wranglerConfig: demos/app/wrangler.jsonc
+    workerEntrypoint: demos/app/.open-next/worker.js
+    assetsDir: demos/app/.open-next/assets
+    workerName: reacherx-unofficial-demo-web
+    environmentAwareWorkerName: true
+    workersDevSubdomain: vijayakrishnan12994
+    installCommand: pnpm install --frozen-lockfile
+    buildCommand: pnpm build:demo:cloudflare
+    smokeCommand: "html=$(curl -sfL \"${DEPLOYED_URL}/plans\") && echo \"${html}\" | grep -q 'Unofficial demo'"
+  labels:
+    team: platform
+    layer: delivery
+    surface: web
+    runtime: cloudflare

@@ -1,0 +1,451 @@
+"use node";
+
+// convex/lib/ragIndexing.ts
+// Helper functions for indexing prospect context to RAG
+// Used by: workflows/qualification.ts, workflows/enrichment.ts
+
+import { ActionCtx } from "../_generated/server";
+import {
+  getAgentMemoryRag,
+  getProspectNamespace,
+  getWorkspaceNamespace,
+  getProspectRag,
+} from "../agents/outreach/rag";
+import type { Doc } from "../_generated/dataModel";
+import { EvidencePost } from "./enrichmentCore";
+import { buildProspectSummaryRecord } from "./readModelHelpers";
+import {
+  buildContentHashFromText,
+  buildQueryCandidateRagText,
+  clampUnitInterval,
+  getNamespaceKindForQueryCandidate,
+} from "./memoryHelpers";
+import { logger } from "../../shared/lib/logger";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+// Re-export EvidencePost for consumers that import from ragIndexing
+export type { EvidencePost };
+
+export interface PainPointForRag {
+  pain: string;
+  solution?: string;
+  evidencePosts: EvidencePost[];
+}
+
+export interface QueryCandidateForRag {
+  targetingFingerprint?: string;
+  queryCandidateId: string;
+  workspaceId: string;
+  embeddingDocKey: string;
+  canonicalKey: string;
+  type: string;
+  rawValue: string;
+  canonicalValue: string;
+  sourceTheme?: string;
+  status: string;
+  importance?: number;
+}
+
+export interface WorkspaceMemoryDocumentForRag {
+  workspaceId: string;
+  namespace: Parameters<typeof getWorkspaceNamespace>[1];
+  key: string;
+  title: string;
+  text: string;
+  importance?: number;
+  prospectId?: string;
+  memoryItemId?: string;
+  category?: string;
+  source?: string;
+}
+
+export interface WorkspaceProspectSummaryForRag {
+  targetingFingerprint?: string;
+  workspaceId: string;
+  namespace: Parameters<typeof getWorkspaceNamespace>[1];
+  prospectId: string;
+  title: string;
+  text: string;
+  importance?: number;
+}
+
+export interface RagIndexResult {
+  indexed: boolean;
+  error?: string;
+  retryable?: boolean;
+  statusCode?: number;
+}
+const ragLogger = logger.withScope("RagIndexing");
+
+function getRagIndexErrorDetails(error: unknown): {
+  message: string;
+  retryable: boolean;
+  statusCode?: number;
+} {
+  if (error instanceof Error) {
+    const providerError = error as Error & {
+      statusCode?: number;
+      responseBody?: string;
+      isRetryable?: boolean;
+    };
+    const responseBody =
+      typeof providerError.responseBody === "string"
+        ? providerError.responseBody.trim()
+        : "";
+    const responseSnippet =
+      responseBody.length > 180
+        ? `${responseBody.slice(0, 177)}...`
+        : responseBody;
+    const messageParts = [providerError.message];
+    if (typeof providerError.statusCode === "number") {
+      messageParts.push(`status=${providerError.statusCode}`);
+    }
+    if (responseSnippet.length > 0) {
+      messageParts.push(`body=${responseSnippet}`);
+    }
+    return {
+      message: messageParts.join(" | "),
+      retryable:
+        providerError.isRetryable ??
+        /Invalid JSON response/i.test(providerError.message),
+      statusCode: providerError.statusCode,
+    };
+  }
+
+  return {
+    message: "Unknown error",
+    retryable: false,
+  };
+}
+
+// ============================================================================
+// RAG Indexing Functions
+// ============================================================================
+
+/**
+ * Index evidence posts from qualification to RAG.
+ *
+ * Called after qualification succeeds. Indexes the posts that
+ * qualified this prospect so the agent can search for context.
+ *
+ * @param ctx - Action context
+ * @param prospectId - Prospect ID for namespace
+ * @param posts - Evidence posts to index
+ */
+export async function indexEvidencePosts(
+  ctx: ActionCtx,
+  prospectId: string,
+  posts: EvidencePost[]
+): Promise<{ indexed: number }> {
+  if (posts.length === 0) {
+    return { indexed: 0 };
+  }
+
+  const namespace = getProspectNamespace(prospectId);
+  let indexed = 0;
+
+  for (const post of posts) {
+    if (!post.text || post.text.trim().length === 0) {
+      continue;
+    }
+
+    try {
+      const contentHash = buildContentHashFromText(post.text);
+      await getProspectRag().add(ctx, {
+        namespace,
+        key: `evidence:${post.id || contentHash}`,
+        text: post.text,
+        contentHash,
+        filterValues: [{ name: "contentType", value: "evidence_post" }],
+      });
+      indexed++;
+    } catch (error) {
+      ragLogger.warn(
+        "Failed to index evidence post",
+        { prospectId, postId: post.id },
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
+  }
+
+  return { indexed };
+}
+
+/**
+ * Index pain points from enrichment to RAG.
+ *
+ * Called after enrichment succeeds. Indexes the identified pain points
+ * so the agent can search for outreach context.
+ *
+ * @param ctx - Action context
+ * @param prospectId - Prospect ID for namespace
+ * @param painPoints - Pain points to index
+ */
+export async function indexPainPoints(
+  ctx: ActionCtx,
+  prospectId: string,
+  painPoints: PainPointForRag[]
+): Promise<{ indexed: number }> {
+  if (painPoints.length === 0) {
+    return { indexed: 0 };
+  }
+
+  const namespace = getProspectNamespace(prospectId);
+  let indexed = 0;
+
+  for (const pp of painPoints) {
+    if (!pp.pain || pp.pain.trim().length === 0) {
+      continue;
+    }
+
+    // Create a combined text with pain + solution for better context
+    let text = `Pain point: ${pp.pain}`;
+    if (pp.solution) {
+      text += `\nHow we help: ${pp.solution}`;
+    }
+
+    try {
+      const contentHash = buildContentHashFromText(text);
+      await getProspectRag().add(ctx, {
+        namespace,
+        key: `pain-point:${buildContentHashFromText(pp.pain)}`,
+        text,
+        contentHash,
+        filterValues: [{ name: "contentType", value: "pain_point" }],
+      });
+      indexed++;
+    } catch (error) {
+      ragLogger.warn(
+        "Failed to index pain point",
+        { prospectId, pain: pp.pain },
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
+  }
+
+  return { indexed };
+}
+
+/**
+ * Index prospect profile/brief intro to RAG.
+ *
+ * Called after enrichment succeeds. Indexes the profile summary
+ * for additional context during outreach.
+ *
+ * @param ctx - Action context
+ * @param prospectId - Prospect ID for namespace
+ * @param profile - Profile text (e.g., briefIntro, bio)
+ */
+export async function indexProfile(
+  ctx: ActionCtx,
+  prospectId: string,
+  profile: string
+): Promise<{ indexed: boolean }> {
+  if (!profile || profile.trim().length === 0) {
+    return { indexed: false };
+  }
+
+  const namespace = getProspectNamespace(prospectId);
+
+  try {
+    const contentHash = buildContentHashFromText(profile);
+    await getProspectRag().add(ctx, {
+      namespace,
+      key: "profile",
+      text: profile,
+      contentHash,
+      filterValues: [{ name: "contentType", value: "profile" }],
+    });
+    return { indexed: true };
+  } catch (error) {
+    ragLogger.warn(
+      "Failed to index profile",
+      { prospectId },
+      error instanceof Error ? error : new Error(String(error))
+    );
+    return { indexed: false };
+  }
+}
+
+/**
+ * Index a query candidate for workspace-level discovery retrieval.
+ */
+export async function indexWorkspaceQueryCandidate(
+  ctx: ActionCtx,
+  candidate: QueryCandidateForRag
+): Promise<{ indexed: boolean }> {
+  const namespace = getWorkspaceNamespace(
+    candidate.workspaceId,
+    getNamespaceKindForQueryCandidate()
+  );
+  const text = buildQueryCandidateRagText({
+    type: candidate.type,
+    rawValue: candidate.rawValue,
+    canonicalValue: candidate.canonicalValue,
+    sourceTheme: candidate.sourceTheme,
+    status: candidate.status,
+  });
+
+  try {
+    await getAgentMemoryRag().add(ctx, {
+      namespace,
+      key: candidate.embeddingDocKey,
+      title: candidate.rawValue,
+      text,
+      contentHash: buildContentHashFromText(
+        `${candidate.targetingFingerprint ?? "legacy"}:${text}`
+      ),
+      importance: clampUnitInterval(candidate.importance, 0.5),
+      metadata: {
+        workspaceId: candidate.workspaceId,
+        queryCandidateId: candidate.queryCandidateId,
+        targetingFingerprint: candidate.targetingFingerprint,
+        canonicalKey: candidate.canonicalKey,
+        type: candidate.type,
+      },
+      filterValues: [{ name: "contentType", value: "query_candidate" }],
+    });
+    return { indexed: true };
+  } catch (error) {
+    ragLogger.warn(
+      "Failed to index query candidate",
+      {
+        workspaceId: candidate.workspaceId,
+        queryCandidateId: candidate.queryCandidateId,
+      },
+      error instanceof Error ? error : new Error(String(error))
+    );
+    return { indexed: false };
+  }
+}
+
+export async function indexWorkspaceMemoryDocument(
+  ctx: ActionCtx,
+  document: WorkspaceMemoryDocumentForRag
+): Promise<RagIndexResult> {
+  const namespace = getWorkspaceNamespace(
+    document.workspaceId,
+    document.namespace
+  );
+
+  try {
+    await getAgentMemoryRag().add(ctx, {
+      namespace,
+      key: document.key,
+      title: document.title,
+      text: document.text,
+      contentHash: buildContentHashFromText(document.text),
+      importance: clampUnitInterval(document.importance, 0.7),
+      metadata: {
+        workspaceId: document.workspaceId,
+        prospectId: document.prospectId,
+        memoryItemId: document.memoryItemId,
+        category: document.category,
+        namespace: document.namespace,
+        source: document.source,
+      },
+      filterValues: [{ name: "contentType", value: "workspace_memory" }],
+    });
+    return { indexed: true };
+  } catch (error) {
+    const details = getRagIndexErrorDetails(error);
+    return {
+      indexed: false,
+      error: details.message,
+      retryable: details.retryable,
+      statusCode: details.statusCode,
+    };
+  }
+}
+
+export async function indexWorkspaceProspectSummary(
+  ctx: ActionCtx,
+  document: WorkspaceProspectSummaryForRag
+): Promise<{ indexed: boolean }> {
+  const namespace = getWorkspaceNamespace(
+    document.workspaceId,
+    document.namespace
+  );
+
+  try {
+    await getAgentMemoryRag().add(ctx, {
+      namespace,
+      key: `workspace-prospect:${document.workspaceId}:${document.namespace}:${document.prospectId}`,
+      title: document.title,
+      text: document.text,
+      contentHash: buildContentHashFromText(
+        `${document.targetingFingerprint ?? "legacy"}:${document.text}`
+      ),
+      importance: clampUnitInterval(document.importance, 0.65),
+      metadata: {
+        workspaceId: document.workspaceId,
+        prospectId: document.prospectId,
+        targetingFingerprint: document.targetingFingerprint,
+        namespace: document.namespace,
+        summaryType: "prospect_summary",
+      },
+      filterValues: [
+        { name: "contentType", value: "workspace_prospect_summary" },
+      ],
+    });
+    return { indexed: true };
+  } catch (error) {
+    ragLogger.warn(
+      "Failed to index workspace prospect summary",
+      {
+        workspaceId: document.workspaceId,
+        prospectId: document.prospectId,
+      },
+      error instanceof Error ? error : new Error(String(error))
+    );
+    return { indexed: false };
+  }
+}
+
+/**
+ * Indexes a prospect into the workspace `prospect_search` RAG namespace for unified list search.
+ */
+export async function indexProspectSearchListEntry(
+  ctx: ActionCtx,
+  prospect: Doc<"prospects">
+): Promise<{ indexed: boolean }> {
+  const summary = buildProspectSummaryRecord(prospect);
+  const text = summary.searchText?.trim();
+  if (!text) {
+    return { indexed: false };
+  }
+  const namespace = getWorkspaceNamespace(
+    String(prospect.workspaceId),
+    "prospect_search"
+  );
+
+  try {
+    await getAgentMemoryRag().add(ctx, {
+      namespace,
+      key: `prospect-search:${String(prospect._id)}`,
+      title: summary.displayName,
+      text,
+      contentHash: buildContentHashFromText(text),
+      importance: 0.7,
+      metadata: {
+        workspaceId: String(prospect.workspaceId),
+        prospectId: String(prospect._id),
+      },
+      filterValues: [{ name: "contentType", value: "prospect_search_list" }],
+    });
+    return { indexed: true };
+  } catch (error) {
+    ragLogger.warn(
+      "Prospect search list index failed",
+      {
+        workspaceId: String(prospect.workspaceId),
+        prospectId: String(prospect._id),
+      },
+      error instanceof Error ? error : new Error(String(error))
+    );
+    return { indexed: false };
+  }
+}

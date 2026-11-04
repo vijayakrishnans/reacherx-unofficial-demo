@@ -1,0 +1,100 @@
+/**
+ * Barrel exports for webapp UI components
+ *
+ * This file serves as a single entry point for importing webapp components,
+ * following the Module Pattern for better organization.
+ *
+ * References:
+ * - Barrel Exports: https://basarat.gitbook.io/typescript/main-1/barrel
+ * - Module Pattern: https://www.patterns.dev/posts/module-pattern
+ */
+
+// ============================================================================
+// Sidebar components
+// ============================================================================
+export {
+  SidebarWrapper,
+  SidebarContentWrapper,
+  SidebarHeader,
+  SidebarNavigation,
+  SidebarResources,
+  SidebarFooter,
+} from "./sidebar";
+
+// ============================================================================
+// Page layout components
+// ============================================================================
+export {
+  DESKTOP_PANEL_BORDER_CLASS_NAME,
+  PageLayout,
+  PageHeader,
+  PageContent,
+  PageScrollArea,
+} from "./page";
+export type {
+  PageLayoutProps,
+  PageHeaderProps,
+  PageContentProps,
+  PageScrollAreaProps,
+} from "./page";
+
+// ============================================================================
+// Tweet/X post components
+// ============================================================================
+export {
+  Tweet,
+  TweetHeader,
+  TweetBody,
+  TweetFooter,
+  TweetMenu,
+  QuoteTweetCard,
+} from "./tweet";
+export type { TweetProps, TweetBodyProps, QuoteTweetCardProps } from "./tweet";
+
+// ============================================================================
+// LinkedIn post components
+// ============================================================================
+export {
+  LinkedInPostCard,
+  LinkedInPostCardSkeleton,
+  LinkedInHeader,
+  LinkedInBody,
+  LinkedInFooter,
+  LinkedInMenu,
+  LinkedInMediaGrid,
+  LinkedInGalleryViewer,
+  LinkedInCommentThread,
+  LinkedInCommentItem,
+  LinkedInReplyComposer,
+  LinkedInReplyList,
+  LinkedInPostThreadPanel,
+  QuoteLinkedInCard,
+  QuoteLinkedInCardSkeleton,
+} from "./linkedin";
+export type {
+  LinkedInPostCardProps,
+  LinkedInHeaderProps,
+  LinkedInBodyProps,
+  LinkedInFooterProps,
+  LinkedInMenuProps,
+  LinkedInMediaGridProps,
+  LinkedInCommentThreadProps,
+  LinkedInCommentThreadPreviewScenario,
+  LinkedInCommentItemProps,
+  LinkedInReplyComposerProps,
+  LinkedInReplyListProps,
+  LinkedInPostThreadPanelProps,
+  QuoteLinkedInCardProps,
+} from "./linkedin";
+
+// ============================================================================
+// Root-level components (unique/provider components)
+// ============================================================================
+export { Header } from "./Header";
+export { NotificationProvider } from "./NotificationProvider";
+export { OnboardingLockGuardProvider } from "./OnboardingLockGuardProvider";
+export {
+  WebAppChromeScaffold,
+  WebAppLoadingContentSkeleton,
+} from "./WebAppChromeScaffold";
+export { WorkspaceTransitionBar } from "./WorkspaceTransitionBar";

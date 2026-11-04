@@ -1,0 +1,47 @@
+diff --git a/index.js b/index.js
+index 6281479142a25d3ad5a1b88cff6dcac5a2b46c55..94b53aac1996449747a6267c95a3f9a37d05cb46 100644
+--- a/index.js
++++ b/index.js
+@@ -114,0 +115,5 @@ export function guessesRemaining(err) {
++// Keep Node-only builtins out of browser bundles. The SDK chooses this branch
++// only at runtime, but static bundlers otherwise still try to resolve these
++// imports while producing the browser chunk.
++const importNodeBuiltin = (specifier) => import(specifier);
++
+@@ -124,7 +129,7 @@ async function initWasmModule() {
+     // Node 18 ships WebCrypto but does not expose it on the global scope,
+     // and the wasm module's random-byte source requires globalThis.crypto.
+     if (typeof globalThis.crypto === "undefined") {
+-      const { webcrypto } = await import("crypto");
++      const { webcrypto } = await importNodeBuiltin("crypto");
+       globalThis.crypto = webcrypto;
+     }
+     // Dynamic import, not require(): the wasm glue is ESM, and require(esm)
+@@ -137,13 +142,13 @@ async function initWasmModule() {
+     if (typeof init !== "function") {
+       throw new Error("WASM init function not found in chat_xdk_wasm module.");
+     }
+-    const fs = await import("fs");
++    const fs = await importNodeBuiltin("fs");
+     const wasmUrl = new URL("./pkg/chat_xdk_wasm_bg.wasm", import.meta.url);
+     let wasmBytes;
+     try {
+       wasmBytes = fs.readFileSync(wasmUrl);
+     } catch (err) {
+-      const { fileURLToPath } = await import("url");
++      const { fileURLToPath } = await importNodeBuiltin("url");
+       wasmBytes = fs.readFileSync(fileURLToPath(wasmUrl));
+     }
+     await init({ module_or_path: wasmBytes });
+@@ -181,9 +186,9 @@
+ async function loadJuiceboxSdkOnce() {
+   if (isNodeRuntime()) {
+     const juiceboxBg = await import("juicebox-sdk/juicebox-sdk_bg.js");
+-    const { createRequire } = await import("module");
++    const { createRequire } = await importNodeBuiltin("module");
+     const require = createRequire(import.meta.url);
+-    const fs = await import("fs");
++    const fs = await importNodeBuiltin("fs");
+     const wasmPath = require.resolve("juicebox-sdk/juicebox-sdk_bg.wasm");
+     const wasmBytes = fs.readFileSync(wasmPath);
+     const { instance } = await WebAssembly.instantiate(wasmBytes, {

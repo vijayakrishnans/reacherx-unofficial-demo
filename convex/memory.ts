@@ -1,0 +1,2562 @@
+import { getStringProperty, isRecord } from "./lib/typeGuards";
+import { logRagSearch } from "./lib/ragSearchHelpers";
+import { learningEntryReferenceValidator } from "./validators";
+import {
+  isCurrentTargetingLearning,
+  isReusablePipelineLesson,
+} from "./lib/learningTargetingHelpers";
+import { v } from "convex/values";
+import { paginationOptsValidator } from "convex/server";
+import type { Doc, Id } from "./_generated/dataModel";
+import type { ActionCtx as ConvexActionCtx } from "./_generated/server";
+import { internal } from "./_generated/api";
+import {
+  getAgentMemoryRag,
+  getWorkspaceNamespace,
+} from "./agents/outreach/rag";
+import { logger } from "../shared/lib/logger";
+import { getCurrentUTCTimestamp } from "../shared/lib/utils/time/timeUtils";
+import {
+  action,
+  internalAction,
+  internalMutation,
+  internalQuery,
+  query,
+} from "./lib/functionBuilders";
+import {
+  recordMemoryWorkflowEvent,
+  upsertQueryCandidateRecord,
+  upsertQueryPerformanceRecord,
+} from "./lib/memoryCore";
+import {
+  buildKeywordCanonicalRecord,
+  buildQueryCandidateCanonicalRecord,
+  createStableHash,
+  getNamespaceKindForQueryCandidate,
+} from "./lib/memoryHelpers";
+import {
+  type AgentMemoryPromotionResult,
+  buildWorkspaceAgentMemoryInventoryRecord,
+  ensureWorkspaceAgentMemoryInventoryRecords,
+  categoryToNamespace,
+  findRelevantAgentMemories,
+  listWorkspaceAgentMemoriesByCategory,
+  listWorkspaceAgentMemoriesBySource,
+  promoteAgentMemory,
+  reconcileWorkspaceAgentMemoryInventoryPage,
+  type ParsedAgentMemory,
+  type WorkspaceMemoryCategory,
+  type WorkspaceMemorySource,
+  type WorkspaceAgentMemoryRecord,
+} from "./lib/agentMemoryCore";
+import {
+  buildCanonicalWorkspaceMemoryRagText,
+  buildWorkspaceMemoryContext as buildCanonicalWorkspaceMemoryContext,
+  claimFailedCanonicalWorkspaceMemoryIndexRetries,
+  listCanonicalWorkspaceMemoryCandidates,
+  listCanonicalLegacyMemoryIds,
+  listCanonicalWorkspaceMemoriesByStoredIds,
+  markCanonicalWorkspaceMemoryIndexResult,
+  searchCanonicalWorkspaceMemories,
+  type CanonicalWorkspaceMemory,
+  type WorkspaceMemoryContext,
+  type WorkspaceMemoryContextRequest,
+  type WorkspaceMemoryProvenanceKind,
+  WORKSPACE_MEMORY_INDEX_RETRY_STAGGER_MS,
+} from "./lib/workspaceMemoryCore";
+import {
+  getCachedSharedMemorySemanticIds,
+  setCachedSharedMemorySemanticIds,
+} from "./lib/sharedMemorySemanticCache";
+import {
+  distillEnrichmentLearning,
+  distillOutreachLearning,
+  distillQualificationLearning,
+} from "./lib/learningCore";
+import {
+  indexProspectSearchListEntry,
+  indexWorkspaceMemoryDocument,
+  indexWorkspaceProspectSummary,
+  indexWorkspaceQueryCandidate,
+} from "./lib/ragIndexing";
+import {
+  memorySourceTypeValidator,
+  memoryWorkflowEventStatusValidator,
+  memoryWorkflowEventTypeValidator,
+  queryCandidateDuplicateReasonValidator,
+  queryCandidateStatusValidator,
+  queryCandidateTypeValidator,
+  workspaceMemoryCategoryValidator,
+  workspaceMemorySourceValidator,
+} from "./validators";
+import { requireOwnedWorkspace, requireUser } from "./lib/accessHelpers";
+import type { WorkspaceUseCaseKey } from "../shared/lib/workspaceUseCases";
+import { getStyleMemoryCategory } from "./lib/styleSourceCore";
+import { evaluateWorkspaceMemoryCompliance } from "./lib/workspaceMemoryCompliance";
+import { isWorkspaceAutomationActive } from "./lib/workspaceSystem";
+import { areAutonomousJobsPaused } from "./lib/autonomousJobHelpers";
+
+const DEFAULT_LIST_LIMIT = 50;
+const MAX_LIST_LIMIT = 200;
+const DISCOVERY_CONTEXT_LIMIT = 6;
+const DISCOVERY_SEMANTIC_DUPLICATE_THRESHOLD = 0.92;
+const DISCOVERY_SEMANTIC_DUPLICATE_RESULT_LIMIT = 3;
+const MEMORY_INVENTORY_BACKFILL_PAGE_SIZE = 500;
+const MEMORY_INVENTORY_ID_PAGE_SIZE = 500;
+const MEMORY_INVENTORY_RECONCILIATION_PAGE_SIZE = 100;
+const MAX_REPORTED_ORPHANED_MEMORY_IDS = 100;
+const memoryLogger = logger.withScope("Memory");
+
+type WorkspaceSemanticMatch = {
+  score: number;
+  text: string;
+  title: string | null;
+  promptLine: string;
+};
+
+type QualificationLearningContext = {
+  queryText: string;
+  policyPrompt: string;
+  complianceInstructions: string[];
+  relevantMemories: string[];
+  similarQualifiedCases: string[];
+  similarDisqualifiedCases: string[];
+};
+
+type OutreachLearningContext = {
+  queryText: string;
+  policyPrompt: string;
+  relevantMemories: string[];
+  winningPatterns: string[];
+  objections: string[];
+  similarCases: string[];
+  operatorPreferences: string[];
+  styleProfiles: string[];
+};
+
+function toListLimit(limit?: number): number {
+  const normalized =
+    typeof limit === "number" ? Math.floor(limit) : DEFAULT_LIST_LIMIT;
+  return Math.min(MAX_LIST_LIMIT, Math.max(1, normalized));
+}
+
+function matchesOptionalFilter<T extends string>(
+  value: T,
+  filter: T | undefined
+): boolean {
+  return filter ? value === filter : true;
+}
+
+function calculateQueryPerformanceRank(row: Doc<"queryPerformance">): number {
+  return (
+    row.convertedCount * 100 +
+    row.replyCount * 25 +
+    row.qualifiedCount * 10 +
+    row.prospectsFound * 2 +
+    row.replyRate +
+    row.qualificationRate
+  );
+}
+
+function formatParsedMemoryForPrompt(memory: ParsedAgentMemory): string {
+  return `${memory.title}: ${memory.summary} (confidence ${memory.confidence.toFixed(2)}, impact ${memory.impactScore.toFixed(2)})`;
+}
+
+function formatSemanticMemoryMatch(match: {
+  text: string;
+  title: string | null;
+}): string {
+  if (match.title) {
+    return `${match.title}: ${match.text}`;
+  }
+
+  return match.text;
+}
+
+function buildWorkspaceMemorySearchQuery(args: {
+  title?: string | null;
+  briefIntro?: string | null;
+  matchedKeywords?: string[];
+  painPoints?: string[];
+  finance?: string | null;
+  additionalContext?: string[];
+}): string {
+  return [
+    args.title ?? "",
+    args.briefIntro ?? "",
+    args.finance ?? "",
+    ...(args.matchedKeywords ?? []),
+    ...(args.painPoints ?? []),
+    ...(args.additionalContext ?? []),
+  ]
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+    .join(" ");
+}
+
+function hasWorkspaceMemorySearchQuery(query: string): boolean {
+  return query.trim().length > 0;
+}
+
+function buildWorkspaceProspectSummaryText(args: {
+  displayName: string;
+  title?: string | null;
+  briefIntro?: string | null;
+  qualificationStatus?: string | null;
+  qualificationScore?: number | null;
+  matchedKeywords?: string[];
+  painPoints?: string[];
+  finance?: string | null;
+  reasoning?: string | null;
+}): string {
+  return [
+    `Prospect: ${args.displayName}`,
+    args.title ? `Title: ${args.title}` : null,
+    args.briefIntro ? `Intro: ${args.briefIntro}` : null,
+    args.qualificationStatus
+      ? `Qualification: ${args.qualificationStatus}${typeof args.qualificationScore === "number" ? ` (${args.qualificationScore})` : ""}`
+      : null,
+    args.matchedKeywords && args.matchedKeywords.length > 0
+      ? `Matched keywords: ${args.matchedKeywords.join(", ")}`
+      : null,
+    args.painPoints && args.painPoints.length > 0
+      ? `Pain points: ${args.painPoints.join("; ")}`
+      : null,
+    args.finance ? `Finance: ${args.finance}` : null,
+    args.reasoning ? `Why it mattered: ${args.reasoning}` : null,
+  ]
+    .filter((line): line is string => typeof line === "string")
+    .join("\n");
+}
+
+async function persistWorkspaceMemoryDraft(
+  ctx: ConvexActionCtx,
+  args: {
+    userId: string;
+    workspaceId: string;
+    category: WorkspaceMemoryCategory;
+    source: WorkspaceMemorySource;
+    title: string;
+    summary: string;
+    confidence: number;
+    impactScore?: number;
+    prospectId?: string;
+    threadId?: string;
+    signals?: string[];
+    evidence?: string[];
+    relatedQueries?: string[];
+    narrative?: string;
+    instruction?: string;
+    canonicalContent?: string;
+    conflictKey?: string;
+    metadata?: unknown;
+    kind?: string;
+    precedence?: number;
+    surfaces?: string[];
+    channels?: string[];
+    provenanceKind?: WorkspaceMemoryProvenanceKind;
+    provenanceMessageId?: string;
+    attachmentUploadIds?: Id<"mediaUploads">[];
+  }
+): Promise<AgentMemoryPromotionResult> {
+  const inserted = await ctx.runMutation(
+    internal.memory.insertBuiltInAgentMemoryInternal,
+    args
+  );
+  if (!inserted.canonicalShouldIndex) {
+    return inserted;
+  }
+
+  await ctx.runAction(internal.memory.indexCanonicalWorkspaceMemoryInternal, {
+    memoryId: inserted.canonicalMemoryId as Id<"workspaceMemories">,
+  });
+
+  return inserted;
+}
+
+export const getQueryCandidateByIdInternal = internalQuery({
+  args: {
+    queryCandidateId: v.id("queryCandidates"),
+  },
+  handler: async (ctx, { queryCandidateId }) => {
+    return await ctx.db.get(queryCandidateId);
+  },
+});
+
+export const getQueryCandidateByCanonicalKeyInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+    canonicalKey: v.string(),
+  },
+  handler: async (ctx, { workspaceId, canonicalKey }) => {
+    const workspace = await ctx.db.get(workspaceId);
+    const candidate = await ctx.db
+      .query("queryCandidates")
+      .withIndex("by_workspace_canonical_key", (q) =>
+        q.eq("workspaceId", workspaceId).eq("canonicalKey", canonicalKey)
+      )
+      .first();
+    return candidate &&
+      workspace &&
+      isCurrentTargetingLearning(candidate, workspace)
+      ? candidate
+      : null;
+  },
+});
+
+export const getDiscoveryGenerationContextInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, { workspaceId }) => {
+    const workspace = await ctx.db.get(workspaceId);
+    if (!workspace) throw new Error("Workspace not found");
+    const memoryContext = buildCanonicalWorkspaceMemoryContext({
+      request: {
+        workspaceId: String(workspaceId),
+        userId: String(workspace.userId),
+        query: workspace.description,
+        surface: "discovery",
+      },
+      memories: (
+        await listCanonicalWorkspaceMemoryCandidates(ctx.db, {
+          workspaceId,
+          userId: workspace.userId,
+        })
+      ).filter(
+        (memory) =>
+          memory.authority === "operator" || isReusablePipelineLesson(memory)
+      ),
+    });
+    const [
+      topPerformers,
+      activeCandidates,
+      exactRejected,
+      semanticRejected,
+      lowNoveltyRejected,
+      retiredCandidates,
+      prospectSummaries,
+    ] = await Promise.all([
+      ctx.db
+        .query("queryPerformance")
+        .withIndex("by_workspace_updated_at", (q) =>
+          q.eq("workspaceId", workspaceId)
+        )
+        .order("desc")
+        .take(MAX_LIST_LIMIT),
+      ctx.db
+        .query("queryCandidates")
+        .withIndex("by_workspace_status", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "activated")
+        )
+        .order("desc")
+        .take(MAX_LIST_LIMIT),
+      ctx.db
+        .query("queryCandidates")
+        .withIndex("by_workspace_status", (q) =>
+          q
+            .eq("workspaceId", workspaceId)
+            .eq("status", "rejected_exact_duplicate")
+        )
+        .order("desc")
+        .take(MAX_LIST_LIMIT),
+      ctx.db
+        .query("queryCandidates")
+        .withIndex("by_workspace_status", (q) =>
+          q
+            .eq("workspaceId", workspaceId)
+            .eq("status", "rejected_semantic_duplicate")
+        )
+        .order("desc")
+        .take(MAX_LIST_LIMIT),
+      ctx.db
+        .query("queryCandidates")
+        .withIndex("by_workspace_status", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "rejected_low_novelty")
+        )
+        .order("desc")
+        .take(MAX_LIST_LIMIT),
+      ctx.db
+        .query("queryCandidates")
+        .withIndex("by_workspace_status", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "retired")
+        )
+        .order("desc")
+        .take(MAX_LIST_LIMIT),
+      ctx.db
+        .query("prospectSummaries")
+        .withIndex("by_workspace_ready_score", (q) =>
+          q.eq("workspaceId", workspaceId).eq("readyQualifiedEnriched", true)
+        )
+        .take(DISCOVERY_CONTEXT_LIMIT),
+    ]);
+
+    const currentWinners = await Promise.all(
+      prospectSummaries.map(async (summary) => {
+        const prospect = await ctx.db.get(summary.prospectId);
+        return prospect &&
+          isCurrentTargetingLearning(
+            {
+              targetingFingerprint: prospect.qualificationTargetingFingerprint,
+            },
+            workspace
+          )
+          ? summary
+          : null;
+      })
+    );
+    return {
+      operatorInstructions: memoryContext.complianceInstructions,
+      topPerformers: topPerformers
+        .filter((row) => isCurrentTargetingLearning(row, workspace))
+        .sort(
+          (a, b) =>
+            calculateQueryPerformanceRank(b) - calculateQueryPerformanceRank(a)
+        )
+        .slice(0, DISCOVERY_CONTEXT_LIMIT)
+        .map((row) => ({
+          canonicalValue: row.canonicalValue,
+          prospectsFound: row.prospectsFound,
+          qualifiedCount: row.qualifiedCount,
+          convertedCount: row.convertedCount,
+          replyCount: row.replyCount,
+          replyRate: row.replyRate,
+          qualificationRate: row.qualificationRate,
+        })),
+      activeQueryCount: activeCandidates.filter((row) =>
+        isCurrentTargetingLearning(row, workspace)
+      ).length,
+      rejectionSummary: {
+        exactDuplicates: exactRejected.filter((row) =>
+          isCurrentTargetingLearning(row, workspace)
+        ).length,
+        semanticDuplicates: semanticRejected.filter((row) =>
+          isCurrentTargetingLearning(row, workspace)
+        ).length,
+        lowNovelty: lowNoveltyRejected.filter((row) =>
+          isCurrentTargetingLearning(row, workspace)
+        ).length,
+      },
+      recentRejected: [
+        ...exactRejected,
+        ...semanticRejected,
+        ...lowNoveltyRejected,
+      ]
+        .filter((row) => isCurrentTargetingLearning(row, workspace))
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, DISCOVERY_CONTEXT_LIMIT)
+        .map((candidate) => ({
+          rawValue: candidate.rawValue,
+          sourceTheme: candidate.sourceTheme,
+          status: candidate.status,
+          duplicateReason: candidate.duplicateReason,
+          noveltyScore: candidate.noveltyScore ?? null,
+        })),
+      retired: retiredCandidates
+        .filter((row) => isCurrentTargetingLearning(row, workspace))
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, DISCOVERY_CONTEXT_LIMIT)
+        .map((candidate) => ({
+          rawValue: candidate.rawValue,
+          sourceTheme: candidate.sourceTheme,
+          retiredAt: candidate.retiredAt ?? null,
+        })),
+      promotedDiscoveryMemories: memoryContext.learnedMemories
+        .slice(0, DISCOVERY_CONTEXT_LIMIT)
+        .map((memory) => ({
+          type: memory.category ?? memory.kind,
+          title: memory.title,
+          summary: memory.canonicalContent,
+          confidence: memory.confidence,
+          impactScore: memory.impactScore,
+        })),
+      recentWinningProspects: currentWinners
+        .filter((summary) => summary !== null)
+        .map((summary) => ({
+          displayName: summary.displayName,
+          title: summary.title ?? null,
+          briefIntro: summary.briefIntro ?? null,
+          matchedKeywords: summary.matchedKeywords ?? [],
+          qualificationScore: summary.qualificationScore ?? null,
+        })),
+    };
+  },
+});
+
+export const upsertQueryCandidateInternal = internalMutation({
+  args: {
+    expectedTargetingFingerprint: v.optional(v.string()),
+    workspaceId: v.id("workspaces"),
+    type: queryCandidateTypeValidator,
+    rawValue: v.string(),
+    sourceTheme: v.optional(v.string()),
+    sourceRunId: v.optional(v.string()),
+    noveltyScore: v.optional(v.number()),
+    status: v.optional(queryCandidateStatusValidator),
+    duplicateReason: v.optional(queryCandidateDuplicateReasonValidator),
+    performanceScore: v.optional(v.number()),
+    activatedKeywordId: v.optional(v.id("keywords")),
+    embeddingDocKey: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const result = await upsertQueryCandidateRecord(ctx.db, args);
+    await ctx.scheduler.runAfter(
+      0,
+      internal.memory.indexQueryCandidateInternal,
+      {
+        queryCandidateId: result.queryCandidateId,
+      }
+    );
+    return result;
+  },
+});
+
+export const upsertQueryPerformanceInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    queryId: v.id("keywords"),
+    canonicalValue: v.string(),
+    canonicalHash: v.string(),
+    activatedQueryCandidateId: v.optional(v.id("queryCandidates")),
+    impressionsDelta: v.optional(v.number()),
+    prospectsFoundDelta: v.optional(v.number()),
+    qualifiedCountDelta: v.optional(v.number()),
+    convertedCountDelta: v.optional(v.number()),
+    replyCountDelta: v.optional(v.number()),
+    lastUsedAt: v.optional(v.number()),
+    retiredAt: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    return await upsertQueryPerformanceRecord(ctx.db, args);
+  },
+});
+
+export const recordMemoryWorkflowEventInternal = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    eventType: memoryWorkflowEventTypeValidator,
+    sourceType: memorySourceTypeValidator,
+    sourceId: v.string(),
+    workflowName: v.optional(v.string()),
+    status: v.optional(memoryWorkflowEventStatusValidator),
+    prospectId: v.optional(v.id("prospects")),
+    planId: v.optional(v.id("outreachPlans")),
+    taskId: v.optional(v.id("outreachTasks")),
+    queryCandidateId: v.optional(v.id("queryCandidates")),
+    queryId: v.optional(v.id("keywords")),
+    payload: v.optional(v.any()),
+    eventKey: v.optional(v.string()),
+    occurredAt: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    return await recordMemoryWorkflowEvent(ctx, args);
+  },
+});
+
+export const insertBuiltInAgentMemoryInternal = internalMutation({
+  args: {
+    userId: v.string(),
+    workspaceId: v.string(),
+    category: v.string(),
+    source: v.string(),
+    title: v.string(),
+    summary: v.string(),
+    confidence: v.number(),
+    impactScore: v.optional(v.number()),
+    prospectId: v.optional(v.string()),
+    threadId: v.optional(v.string()),
+    signals: v.optional(v.array(v.string())),
+    evidence: v.optional(v.array(v.string())),
+    relatedQueries: v.optional(v.array(v.string())),
+    narrative: v.optional(v.string()),
+    instruction: v.optional(v.string()),
+    canonicalContent: v.optional(v.string()),
+    conflictKey: v.optional(v.string()),
+    metadata: v.optional(v.any()),
+    kind: v.optional(v.string()),
+    precedence: v.optional(v.number()),
+    surfaces: v.optional(v.array(v.string())),
+    channels: v.optional(v.array(v.string())),
+    provenanceKind: v.optional(
+      v.union(
+        v.literal("user_instruction"),
+        v.literal("agent_learning"),
+        v.literal("style_analysis"),
+        v.literal("legacy_backfill")
+      )
+    ),
+    provenanceMessageId: v.optional(v.string()),
+    attachmentUploadIds: v.optional(v.array(v.id("mediaUploads"))),
+  },
+  handler: async (ctx, args) => {
+    return await promoteAgentMemory(ctx.db, {
+      userId: args.userId,
+      workspaceId: args.workspaceId,
+      category: args.category as WorkspaceMemoryCategory,
+      namespace: categoryToNamespace(args.category as WorkspaceMemoryCategory),
+      source: args.source as WorkspaceMemorySource,
+      title: args.title,
+      summary: args.summary,
+      confidence: args.confidence,
+      impactScore: args.impactScore,
+      prospectId: args.prospectId,
+      threadId: args.threadId,
+      signals: args.signals,
+      evidence: args.evidence,
+      relatedQueries: args.relatedQueries,
+      narrative: args.narrative,
+      instruction: args.instruction,
+      canonicalContent: args.canonicalContent,
+      conflictKey: args.conflictKey,
+      metadata: args.metadata,
+      kind: args.kind,
+      precedence: args.precedence,
+      surfaces: args.surfaces,
+      channels: args.channels,
+      provenanceKind: args.provenanceKind,
+      provenanceMessageId: args.provenanceMessageId,
+      attachmentUploadIds: args.attachmentUploadIds,
+    });
+  },
+});
+
+/**
+ * Single idempotent write + RAG-index entry point used by explicit operator
+ * tools and background learning. The underlying mutation dual-writes the
+ * canonical row and legacy read models in one transaction.
+ */
+export const persistCanonicalWorkspaceMemoryInternal = internalAction({
+  args: {
+    userId: v.string(),
+    workspaceId: v.string(),
+    category: workspaceMemoryCategoryValidator,
+    source: workspaceMemorySourceValidator,
+    title: v.string(),
+    summary: v.string(),
+    confidence: v.number(),
+    impactScore: v.optional(v.number()),
+    prospectId: v.optional(v.string()),
+    threadId: v.optional(v.string()),
+    signals: v.optional(v.array(v.string())),
+    evidence: v.optional(v.array(v.string())),
+    relatedQueries: v.optional(v.array(v.string())),
+    narrative: v.optional(v.string()),
+    instruction: v.optional(v.string()),
+    canonicalContent: v.optional(v.string()),
+    conflictKey: v.optional(v.string()),
+    metadata: v.optional(v.any()),
+    kind: v.optional(v.string()),
+    precedence: v.optional(v.number()),
+    surfaces: v.optional(v.array(v.string())),
+    channels: v.optional(v.array(v.string())),
+    provenanceKind: v.optional(
+      v.union(
+        v.literal("user_instruction"),
+        v.literal("agent_learning"),
+        v.literal("style_analysis"),
+        v.literal("legacy_backfill")
+      )
+    ),
+    provenanceMessageId: v.optional(v.string()),
+    attachmentUploadIds: v.optional(v.array(v.id("mediaUploads"))),
+  },
+  handler: async (ctx, args): Promise<AgentMemoryPromotionResult> =>
+    await persistWorkspaceMemoryDraft(ctx, {
+      ...args,
+      category: args.category as WorkspaceMemoryCategory,
+      source: args.source as WorkspaceMemorySource,
+    }),
+});
+
+export const markCanonicalWorkspaceMemoryIndexResultInternal = internalMutation(
+  {
+    args: {
+      memoryId: v.id("workspaceMemories"),
+      contentHash: v.string(),
+      indexed: v.boolean(),
+      error: v.optional(v.string()),
+      retryable: v.optional(v.boolean()),
+      retryClaimToken: v.optional(v.string()),
+    },
+    handler: async (ctx, args): Promise<boolean> =>
+      await markCanonicalWorkspaceMemoryIndexResult(ctx.db, args),
+  }
+);
+
+export const getCanonicalWorkspaceMemoryForIndexInternal = internalQuery({
+  args: { memoryId: v.id("workspaceMemories") },
+  handler: async (ctx, args) => await ctx.db.get(args.memoryId),
+});
+
+/** Idempotent canonical RAG indexing with bounded exponential retries. */
+export const indexCanonicalWorkspaceMemoryInternal = internalAction({
+  args: {
+    memoryId: v.id("workspaceMemories"),
+    attempt: v.optional(v.number()),
+    inlineRetries: v.optional(v.boolean()),
+    retryClaimToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const memory = await ctx.runQuery(
+      internal.memory.getCanonicalWorkspaceMemoryForIndexInternal,
+      { memoryId: args.memoryId }
+    );
+    if (!memory || memory.status !== "active") {
+      return { indexed: false, skipped: true };
+    }
+    if (
+      args.retryClaimToken !== undefined &&
+      memory.indexRetryClaimToken !== args.retryClaimToken
+    ) {
+      return { indexed: false, skipped: true };
+    }
+    if (memory.indexStatus === "ready") {
+      return { indexed: true, skipped: true };
+    }
+
+    const indexResult = await indexWorkspaceMemoryDocument(ctx, {
+      workspaceId: String(memory.workspaceId),
+      namespace: memory.ragNamespace as Parameters<
+        typeof getWorkspaceNamespace
+      >[1],
+      key: memory.ragKey,
+      title: memory.title,
+      text: buildCanonicalWorkspaceMemoryRagText({
+        title: memory.title,
+        summary: memory.summary,
+        canonicalContent: memory.canonicalContent,
+        instruction: memory.instruction,
+        kind: memory.kind,
+        metadata: memory.metadata,
+      }),
+      importance: memory.impactScore,
+      prospectId: memory.prospectId ? String(memory.prospectId) : undefined,
+      memoryItemId: String(memory._id),
+      category: memory.category,
+      source: memory.source,
+    });
+    const resultRecorded = await ctx.runMutation(
+      internal.memory.markCanonicalWorkspaceMemoryIndexResultInternal,
+      {
+        memoryId: memory._id,
+        contentHash: memory.contentHash,
+        indexed: indexResult.indexed,
+        error: indexResult.indexed
+          ? undefined
+          : (indexResult.error ?? "Unknown indexing error"),
+        retryable: indexResult.retryable,
+        retryClaimToken: args.retryClaimToken,
+      }
+    );
+    const attempt = args.attempt ?? 0;
+    if (
+      resultRecorded &&
+      !indexResult.indexed &&
+      indexResult.retryable &&
+      args.inlineRetries !== false &&
+      args.retryClaimToken === undefined &&
+      attempt < 3
+    ) {
+      await ctx.scheduler.runAfter(
+        1_000 * 2 ** attempt,
+        internal.memory.indexCanonicalWorkspaceMemoryInternal,
+        {
+          memoryId: memory._id,
+          attempt: attempt + 1,
+          inlineRetries: true,
+        }
+      );
+      return { indexed: false, retryScheduled: true };
+    }
+    return { indexed: indexResult.indexed, retryScheduled: false };
+  },
+});
+
+/**
+ * Claims and schedules one bounded retry batch atomically. The action itself
+ * performs one attempt; durable backoff is recorded when that attempt fails.
+ */
+export const retryFailedCanonicalWorkspaceMemoryIndexesCron = internalMutation({
+  args: {},
+  returns: v.object({
+    claimed: v.number(),
+    scheduled: v.number(),
+  }),
+  handler: async (ctx) => {
+    if (areAutonomousJobsPaused()) {
+      console.warn(
+        "[WorkspaceMemory] Autonomous jobs paused, skipping index retry cron"
+      );
+      return { claimed: 0, scheduled: 0 };
+    }
+
+    const activeWorkspaceCache = new Map<Id<"workspaces">, boolean>();
+    const isActiveWorkspace = async (
+      workspaceId: Id<"workspaces">
+    ): Promise<boolean> => {
+      const cached = activeWorkspaceCache.get(workspaceId);
+      if (cached !== undefined) {
+        return cached;
+      }
+      const workspace = await ctx.db.get(workspaceId);
+      const isActive = workspace
+        ? isWorkspaceAutomationActive(workspace)
+        : false;
+      activeWorkspaceCache.set(workspaceId, isActive);
+      return isActive;
+    };
+
+    const claims = await claimFailedCanonicalWorkspaceMemoryIndexRetries(
+      ctx.db,
+      {
+        shouldClaim: (row) => isActiveWorkspace(row.workspaceId),
+      }
+    );
+
+    for (const [index, claim] of claims.entries()) {
+      await ctx.scheduler.runAfter(
+        index * WORKSPACE_MEMORY_INDEX_RETRY_STAGGER_MS,
+        internal.memory.indexCanonicalWorkspaceMemoryInternal,
+        {
+          memoryId: claim.memoryId,
+          retryClaimToken: claim.claimToken,
+          inlineRetries: false,
+        }
+      );
+    }
+    return { claimed: claims.length, scheduled: claims.length };
+  },
+});
+
+export const ensureWorkspaceAgentMemoryInventoryBatchInternal =
+  internalMutation({
+    args: {
+      workspaceId: v.id("workspaces"),
+      rows: v.array(
+        v.object({
+          memoryId: v.string(),
+          createdAt: v.number(),
+          title: v.string(),
+          summary: v.string(),
+          source: workspaceMemorySourceValidator,
+          category: workspaceMemoryCategoryValidator,
+          confidence: v.number(),
+          impactScore: v.number(),
+          relatedQueriesCount: v.number(),
+          evidenceCount: v.number(),
+          prospectId: v.optional(v.string()),
+        })
+      ),
+    },
+    handler: async (ctx, args) => {
+      return await ensureWorkspaceAgentMemoryInventoryRecords(ctx.db, {
+        workspaceId: args.workspaceId,
+        records: args.rows,
+      });
+    },
+  });
+
+export const reconcileWorkspaceAgentMemoryInventoryBatchInternal =
+  internalMutation({
+    args: {
+      workspaceId: v.id("workspaces"),
+      paginationOpts: paginationOptsValidator,
+    },
+    handler: async (ctx, args) => {
+      return await reconcileWorkspaceAgentMemoryInventoryPage(ctx.db, {
+        workspaceId: args.workspaceId,
+        cursor: args.paginationOpts.cursor,
+        limit: args.paginationOpts.numItems,
+      });
+    },
+  });
+
+export const reconcileWorkspaceAgentMemoryInventoryInternal = internalAction({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, args) => {
+    let cursor: string | null = null;
+    let scanned = 0;
+    let deleted = 0;
+    const deletedMemoryIds: string[] = [];
+
+    while (true) {
+      const result: {
+        continueCursor: string;
+        isDone: boolean;
+        scanned: number;
+        deleted: number;
+        deletedMemoryIds: string[];
+      } = await ctx.runMutation(
+        internal.memory.reconcileWorkspaceAgentMemoryInventoryBatchInternal,
+        {
+          workspaceId: args.workspaceId,
+          paginationOpts: {
+            cursor,
+            numItems: MEMORY_INVENTORY_RECONCILIATION_PAGE_SIZE,
+          },
+        }
+      );
+      scanned += result.scanned;
+      deleted += result.deleted;
+      deletedMemoryIds.push(
+        ...result.deletedMemoryIds.slice(
+          0,
+          MAX_REPORTED_ORPHANED_MEMORY_IDS - deletedMemoryIds.length
+        )
+      );
+
+      if (result.isDone) {
+        return { scanned, deleted, deletedMemoryIds };
+      }
+      cursor = result.continueCursor;
+    }
+  },
+});
+
+export const listWorkspaceAgentMemoryInventoryIdsPageInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+    paginationOpts: paginationOptsValidator,
+  },
+  handler: async (ctx, args) => {
+    const page = await ctx.db
+      .query("workspaceAgentMemoryInventory")
+      .withIndex("by_workspace_created_at", (q) =>
+        q.eq("workspaceId", args.workspaceId)
+      )
+      .paginate(args.paginationOpts);
+    return {
+      ...page,
+      page: page.page.map((row) => row.memoryId),
+    };
+  },
+});
+
+export const backfillWorkspaceAgentMemoryInventoryInternal = internalAction({
+  args: {
+    workspaceId: v.id("workspaces"),
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args) => {
+    const existingMemoryIds = new Set<string>();
+    let inventoryCursor: string | null = null;
+    while (true) {
+      const inventoryPage: {
+        page: string[];
+        continueCursor: string;
+        isDone: boolean;
+      } = await ctx.runQuery(
+        internal.memory.listWorkspaceAgentMemoryInventoryIdsPageInternal,
+        {
+          workspaceId: args.workspaceId,
+          paginationOpts: {
+            cursor: inventoryCursor,
+            numItems: MEMORY_INVENTORY_ID_PAGE_SIZE,
+          },
+        }
+      );
+      for (const memoryId of inventoryPage.page) {
+        existingMemoryIds.add(memoryId);
+      }
+      if (inventoryPage.isDone) {
+        break;
+      }
+      inventoryCursor = inventoryPage.continueCursor;
+    }
+
+    let cursor: string | null = null;
+    let scanned = 0;
+    let inserted = 0;
+    let existing = 0;
+
+    while (true) {
+      const page = (await ctx.runQuery(
+        internal.agentOpsReadModels
+          .listWorkspaceBuiltInMemoriesPageForReadModelInternal,
+        {
+          workspaceId: args.workspaceId,
+          userId: args.userId,
+          paginationOpts: {
+            cursor,
+            numItems: MEMORY_INVENTORY_BACKFILL_PAGE_SIZE,
+          },
+        }
+      )) as {
+        page: Array<
+          Pick<WorkspaceAgentMemoryRecord, "memoryId" | "createdAt" | "parsed">
+        >;
+        continueCursor: string;
+        isDone: boolean;
+      };
+
+      scanned += page.page.length;
+      const missingRows = page.page.filter(
+        (memory) => !existingMemoryIds.has(memory.memoryId)
+      );
+      existing += page.page.length - missingRows.length;
+
+      if (missingRows.length > 0) {
+        const batchResult = await ctx.runMutation(
+          internal.memory.ensureWorkspaceAgentMemoryInventoryBatchInternal,
+          {
+            workspaceId: args.workspaceId,
+            rows: missingRows.map((memory) =>
+              buildWorkspaceAgentMemoryInventoryRecord(memory)
+            ),
+          }
+        );
+        inserted += batchResult.inserted;
+        existing += batchResult.existing;
+        for (const memory of missingRows) {
+          existingMemoryIds.add(memory.memoryId);
+        }
+      }
+
+      if (page.isDone) {
+        break;
+      }
+      cursor = page.continueCursor;
+    }
+
+    return { scanned, inserted, existing };
+  },
+});
+
+export const findRelevantBuiltInAgentMemoriesInternal = internalQuery({
+  args: {
+    userId: v.string(),
+    workspaceId: v.string(),
+    query: v.string(),
+    limit: v.optional(v.number()),
+    categories: v.optional(v.array(v.string())),
+  },
+  handler: async (ctx, args) => {
+    const matches = await findRelevantAgentMemories(ctx.db, {
+      userId: args.userId,
+      workspaceId: args.workspaceId,
+      query: args.query,
+      limit: args.limit ?? 5,
+      categories: args.categories as WorkspaceMemoryCategory[] | undefined,
+    });
+
+    return matches.map((match) => ({
+      memoryId: match.memoryId,
+      createdAt: match.createdAt,
+      relevanceScore: match.relevanceScore,
+      parsed: match.parsed,
+      promptLine: formatParsedMemoryForPrompt(match.parsed),
+    }));
+  },
+});
+
+export const listPinnedWorkspaceMemoriesInternal = internalQuery({
+  args: {
+    workspaceId: v.string(),
+    category: v.optional(workspaceMemoryCategoryValidator),
+    source: v.optional(workspaceMemorySourceValidator),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const records = args.category
+      ? await listWorkspaceAgentMemoriesByCategory(ctx.db, {
+          workspaceId: args.workspaceId as Doc<"workspaces">["_id"],
+          category: args.category,
+          limit: args.limit ?? 10,
+        })
+      : args.source
+        ? await listWorkspaceAgentMemoriesBySource(ctx.db, {
+            workspaceId: args.workspaceId as Doc<"workspaces">["_id"],
+            source: args.source,
+            limit: args.limit ?? 10,
+          })
+        : [];
+
+    return records.map((record) => ({
+      memoryId: record.memoryId,
+      createdAt: record.createdAt,
+      parsed: record.parsed,
+      promptLine: formatParsedMemoryForPrompt(record.parsed),
+    }));
+  },
+});
+
+export const filterCurrentLearningEntriesInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+    namespace: v.string(),
+    entries: v.array(learningEntryReferenceValidator),
+  },
+  returns: v.array(v.string()),
+  handler: async (ctx, args) => {
+    const workspace = await ctx.db.get(args.workspaceId);
+    if (!workspace) return [];
+    const allowed = await Promise.all(
+      args.entries.slice(0, 64).map(async (entry) => {
+        if (!entry.sourceId || !isCurrentTargetingLearning(entry, workspace))
+          return null;
+        if (args.namespace === "queries") {
+          const id = ctx.db.normalizeId("queryCandidates", entry.sourceId);
+          const candidate = id ? await ctx.db.get(id) : null;
+          return candidate &&
+            candidate.workspaceId === workspace._id &&
+            isCurrentTargetingLearning(candidate, workspace)
+            ? entry.entryId
+            : null;
+        }
+        const id = ctx.db.normalizeId("prospects", entry.sourceId);
+        const prospect = id ? await ctx.db.get(id) : null;
+        const expected =
+          args.namespace === "verified_wins"
+            ? "qualified"
+            : args.namespace === "verified_losses"
+              ? "disqualified"
+              : undefined;
+        return prospect &&
+          prospect.workspaceId === workspace._id &&
+          prospect.origin !== "setup_preview" &&
+          expected &&
+          prospect.qualificationStatus === expected &&
+          isCurrentTargetingLearning(
+            {
+              targetingFingerprint: prospect.qualificationTargetingFingerprint,
+            },
+            workspace
+          )
+          ? entry.entryId
+          : null;
+      })
+    );
+    return allowed.filter((id): id is string => id !== null);
+  },
+});
+
+export const searchWorkspaceMemoryNamespaceInternal = internalAction({
+  args: {
+    workspaceId: v.string(),
+    namespace: v.string(),
+    query: v.string(),
+    limit: v.optional(v.number()),
+  },
+  handler: async (
+    ctx,
+    { workspaceId, namespace, query, limit }
+  ): Promise<{
+    matches: WorkspaceSemanticMatch[];
+  }> => {
+    if (!hasWorkspaceMemorySearchQuery(query)) {
+      return { matches: [] };
+    }
+
+    const searchLimit = limit ?? 3;
+    const searchStartedAt = getCurrentUTCTimestamp();
+    try {
+      const result = await getAgentMemoryRag().search(ctx, {
+        namespace: getWorkspaceNamespace(
+          workspaceId,
+          namespace as Parameters<typeof getWorkspaceNamespace>[1]
+        ),
+        query,
+        limit: searchLimit,
+      });
+      logRagSearch({
+        caller: "workspace_memory_namespace_search",
+        workspaceId,
+        namespace,
+        limit: searchLimit,
+        resultCount: result.entries.length,
+        durationMs: getCurrentUTCTimestamp() - searchStartedAt,
+        outcome: "success",
+      });
+
+      const allowedIds =
+        namespace === "verified_wins" || namespace === "verified_losses"
+          ? new Set(
+              await ctx.runQuery(
+                internal.memory.filterCurrentLearningEntriesInternal,
+                {
+                  workspaceId: workspaceId as Id<"workspaces">,
+                  namespace,
+                  entries: result.entries.map((entry) => ({
+                    entryId: entry.entryId,
+                    targetingFingerprint: getStringProperty(
+                      isRecord(entry.metadata) ? entry.metadata : undefined,
+                      "targetingFingerprint"
+                    ),
+                    sourceId: getStringProperty(
+                      isRecord(entry.metadata) ? entry.metadata : undefined,
+                      "prospectId"
+                    ),
+                  })),
+                }
+              )
+            )
+          : null;
+      return {
+        matches: result.results
+          .filter((entry) => !allowedIds || allowedIds.has(entry.entryId))
+          .slice(0, searchLimit)
+          .map((entry): WorkspaceSemanticMatch => {
+            const text = entry.content.map((chunk) => chunk.text).join("\n");
+            return {
+              score: entry.score,
+              text,
+              title: null,
+              promptLine: formatSemanticMemoryMatch({
+                text,
+                title: null,
+              }),
+            };
+          }),
+      };
+    } catch (error) {
+      logRagSearch({
+        caller: "workspace_memory_namespace_search",
+        workspaceId,
+        namespace,
+        limit: searchLimit,
+        resultCount: 0,
+        durationMs: getCurrentUTCTimestamp() - searchStartedAt,
+        outcome: "error",
+      });
+      memoryLogger.warn("Workspace memory namespace search failed", {
+        workspaceId,
+        namespace,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { matches: [] };
+    }
+  },
+});
+
+export const listCanonicalWorkspaceMemoryCandidatesInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args): Promise<CanonicalWorkspaceMemory[]> =>
+    await listCanonicalWorkspaceMemoryCandidates(ctx.db, args),
+});
+
+export const ownsWorkspaceMemoryScopeInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args): Promise<boolean> => {
+    const workspace = await ctx.db.get("workspaces", args.workspaceId);
+    return workspace?.userId === args.userId;
+  },
+});
+
+export const listCanonicalLegacyMemoryIdsInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+    userId: v.id("users"),
+    legacyMemoryIds: v.array(v.string()),
+  },
+  handler: async (ctx, args): Promise<string[]> =>
+    await listCanonicalLegacyMemoryIds(ctx.db, args),
+});
+
+export const searchCanonicalWorkspaceMemoriesInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+    userId: v.id("users"),
+    query: v.string(),
+    authority: v.optional(v.union(v.literal("operator"), v.literal("learned"))),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args): Promise<CanonicalWorkspaceMemory[]> =>
+    await searchCanonicalWorkspaceMemories(ctx.db, args),
+});
+
+export const getCanonicalWorkspaceMemoriesByIdsInternal = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+    userId: v.id("users"),
+    memoryIds: v.array(v.string()),
+  },
+  handler: async (ctx, args): Promise<CanonicalWorkspaceMemory[]> =>
+    await listCanonicalWorkspaceMemoriesByStoredIds(ctx.db, args),
+});
+
+const SHARED_MEMORY_SEMANTIC_THRESHOLD = 0.55;
+const SHARED_MEMORY_SEMANTIC_NAMESPACES = [
+  "lessons",
+  "patterns",
+  "objections",
+  "wins",
+  "losses",
+  "style",
+] as const;
+
+async function buildWorkspaceMemoryContextFromStore(
+  ctx: ConvexActionCtx,
+  request: WorkspaceMemoryContextRequest
+): Promise<WorkspaceMemoryContext> {
+  const ids = {
+    workspaceId: request.workspaceId as Id<"workspaces">,
+    userId: request.userId as Id<"users">,
+  };
+  const ownsWorkspace = await ctx.runQuery(
+    internal.memory.ownsWorkspaceMemoryScopeInternal,
+    ids
+  );
+  if (!ownsWorkspace) {
+    return buildCanonicalWorkspaceMemoryContext({
+      request,
+      memories: [],
+    });
+  }
+  const [candidates, exactMatches] = await Promise.all([
+    ctx.runQuery(
+      internal.memory.listCanonicalWorkspaceMemoryCandidatesInternal,
+      ids
+    ),
+    request.query.trim()
+      ? ctx.runQuery(internal.memory.searchCanonicalWorkspaceMemoriesInternal, {
+          ...ids,
+          query: request.query,
+          limit: 32,
+        })
+      : Promise.resolve([] as CanonicalWorkspaceMemory[]),
+  ]);
+  const legacyOperatorRows = await ctx.runQuery(
+    internal.memory.listPinnedWorkspaceMemoriesInternal,
+    {
+      workspaceId: request.workspaceId,
+      source: "operator",
+      limit: 120,
+    }
+  );
+  const canonicalLegacyIds = new Set(
+    await ctx.runQuery(internal.memory.listCanonicalLegacyMemoryIdsInternal, {
+      ...ids,
+      legacyMemoryIds: legacyOperatorRows.map(
+        (memory: { memoryId: string }) => memory.memoryId
+      ),
+    })
+  );
+  const legacyOperatorFallbacks: CanonicalWorkspaceMemory[] = legacyOperatorRows
+    .filter(
+      (memory: { memoryId: string }) => !canonicalLegacyIds.has(memory.memoryId)
+    )
+    .map(
+      (memory: {
+        memoryId: string;
+        createdAt: number;
+        parsed: ParsedAgentMemory;
+      }) => {
+        const instruction = [
+          memory.parsed.summary,
+          memory.parsed.narrative,
+          ...memory.parsed.evidence,
+        ]
+          .map((value) => value.trim())
+          .filter(Boolean)
+          .filter((value, index, values) => values.indexOf(value) === index)
+          .join("\n");
+        return {
+          memoryId: `legacy:${memory.memoryId}`,
+          workspaceId: request.workspaceId,
+          userId: request.userId,
+          identityKey: `legacy:${memory.memoryId}`,
+          legacyMemoryId: memory.memoryId,
+          authority: "operator" as const,
+          source: "operator" as const,
+          category: memory.parsed.category,
+          status: "active" as const,
+          indexStatus: "ready" as const,
+          kind: memory.parsed.category,
+          title: memory.parsed.title,
+          summary: memory.parsed.summary,
+          canonicalContent: instruction,
+          canonicalSearchText: instruction,
+          instruction,
+          metadata: {
+            evidence: memory.parsed.evidence,
+            relatedQueries: memory.parsed.relatedQueries,
+            verbatimRecovered: false,
+          },
+          precedence: 1_000,
+          confidence: memory.parsed.confidence,
+          impactScore: memory.parsed.impactScore,
+          prospectId: memory.parsed.prospectId,
+          provenanceKind: "legacy_backfill" as const,
+          ragNamespace: memory.parsed.namespace,
+          ragKey: `legacy:${memory.memoryId}`,
+          contentHash: createStableHash(instruction),
+          createdAt: memory.createdAt,
+          updatedAt: memory.createdAt,
+        } satisfies CanonicalWorkspaceMemory;
+      }
+    );
+  const rolloutCandidates = [...legacyOperatorFallbacks, ...candidates];
+  if (!request.query.trim()) {
+    return buildCanonicalWorkspaceMemoryContext({
+      request,
+      memories: [...exactMatches, ...rolloutCandidates],
+    });
+  }
+
+  // Semantic matches resolve through the canonical store, so a workspace with
+  // no candidates and no legacy operator fallbacks cannot gain anything from
+  // the shared namespace searches. Skipping them keeps qualification and
+  // outreach runs cheap for fresh or empty workspaces.
+  if (rolloutCandidates.length === 0) {
+    return buildCanonicalWorkspaceMemoryContext({
+      request,
+      memories: exactMatches,
+    });
+  }
+
+  const now = getCurrentUTCTimestamp();
+  let semanticMemoryIds = getCachedSharedMemorySemanticIds({
+    workspaceId: request.workspaceId,
+    query: request.query,
+    nowMs: now,
+  });
+
+  if (semanticMemoryIds) {
+    logRagSearch({
+      caller: "shared_workspace_memory_context",
+      workspaceId: request.workspaceId,
+      namespace: "shared",
+      limit: 0,
+      resultCount: semanticMemoryIds.length,
+      durationMs: 0,
+      outcome: "cache_hit",
+    });
+  } else {
+    const namespaceGroups = await Promise.all(
+      SHARED_MEMORY_SEMANTIC_NAMESPACES.map(async (namespace) => {
+        const searchStartedAt = getCurrentUTCTimestamp();
+        try {
+          const result = await getAgentMemoryRag().search(ctx, {
+            namespace: getWorkspaceNamespace(request.workspaceId, namespace),
+            query: request.query,
+            limit: 4,
+            vectorScoreThreshold: SHARED_MEMORY_SEMANTIC_THRESHOLD,
+          });
+          logRagSearch({
+            caller: "shared_workspace_memory_context",
+            workspaceId: request.workspaceId,
+            namespace,
+            limit: 4,
+            resultCount: result.entries.length,
+            durationMs: getCurrentUTCTimestamp() - searchStartedAt,
+            outcome: "success",
+          });
+          return {
+            memoryIds: result.entries
+              .map((entry) => entry.metadata?.memoryItemId)
+              .filter(
+                (memoryId): memoryId is string =>
+                  typeof memoryId === "string" && memoryId.length > 0
+              ),
+            succeeded: true,
+          };
+        } catch (error) {
+          logRagSearch({
+            caller: "shared_workspace_memory_context",
+            workspaceId: request.workspaceId,
+            namespace,
+            limit: 4,
+            resultCount: 0,
+            durationMs: getCurrentUTCTimestamp() - searchStartedAt,
+            outcome: "error",
+          });
+          memoryLogger.warn("Shared workspace memory semantic search failed", {
+            workspaceId: request.workspaceId,
+            namespace,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return { memoryIds: [] as string[], succeeded: false };
+        }
+      })
+    );
+
+    const flattenedIds = [
+      ...new Set(namespaceGroups.flatMap((group) => group.memoryIds)),
+    ].slice(0, 64);
+    if (namespaceGroups.every((group) => group.succeeded)) {
+      setCachedSharedMemorySemanticIds({
+        workspaceId: request.workspaceId,
+        query: request.query,
+        memoryIds: flattenedIds,
+        nowMs: getCurrentUTCTimestamp(),
+      });
+    }
+    semanticMemoryIds = flattenedIds;
+  }
+
+  const semanticMemories = semanticMemoryIds.length
+    ? await ctx.runQuery(
+        internal.memory.getCanonicalWorkspaceMemoriesByIdsInternal,
+        {
+          ...ids,
+          memoryIds: semanticMemoryIds,
+        }
+      )
+    : [];
+
+  const byId = new Map<string, CanonicalWorkspaceMemory>();
+  for (const memory of [
+    ...exactMatches,
+    ...semanticMemories,
+    ...rolloutCandidates,
+  ]) {
+    byId.set(memory.memoryId, memory);
+  }
+  const base = buildCanonicalWorkspaceMemoryContext({
+    request,
+    memories: [...byId.values()],
+  });
+  const applicableMemoryIds = new Set(base.memoryIds);
+  const semanticMatches = semanticMemories
+    .filter((memory) => applicableMemoryIds.has(memory.memoryId))
+    .map((memory) => memory.canonicalContent)
+    .slice(0, 8);
+
+  return {
+    ...base,
+    semanticMatches,
+  };
+}
+
+export const buildWorkspaceMemoryContextInternal = internalAction({
+  args: {
+    workspaceId: v.id("workspaces"),
+    userId: v.id("users"),
+    query: v.string(),
+    surface: v.string(),
+    prospectId: v.optional(v.id("prospects")),
+    channel: v.optional(v.string()),
+  },
+  handler: async (ctx, args): Promise<WorkspaceMemoryContext> =>
+    await buildWorkspaceMemoryContextFromStore(ctx, {
+      workspaceId: String(args.workspaceId),
+      userId: String(args.userId),
+      query: args.query,
+      surface: args.surface,
+      prospectId: args.prospectId ? String(args.prospectId) : undefined,
+      channel: args.channel,
+    }),
+});
+
+export const evaluateWorkspaceMemoryComplianceInternal = internalAction({
+  args: {
+    workspaceId: v.id("workspaces"),
+    userId: v.id("users"),
+    query: v.string(),
+    surface: v.string(),
+    prospectId: v.optional(v.id("prospects")),
+    channel: v.optional(v.string()),
+    taskContext: v.string(),
+    candidate: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const memoryContext = await buildWorkspaceMemoryContextFromStore(ctx, {
+      workspaceId: String(args.workspaceId),
+      userId: String(args.userId),
+      query: args.query,
+      surface: args.surface,
+      prospectId: args.prospectId ? String(args.prospectId) : undefined,
+      channel: args.channel,
+    });
+    const evaluation = await evaluateWorkspaceMemoryCompliance({
+      instructions: memoryContext.complianceInstructions,
+      taskContext: args.taskContext,
+      candidate: args.candidate,
+    });
+    return { ...evaluation, memoryIds: memoryContext.memoryIds };
+  },
+});
+
+export const getQualificationLearningContextInternal = internalAction({
+  args: {
+    workspaceId: v.string(),
+    userId: v.string(),
+    title: v.optional(v.string()),
+    briefIntro: v.optional(v.string()),
+    matchedKeywords: v.array(v.string()),
+    evidenceHighlights: v.array(v.string()),
+    prospectId: v.optional(v.string()),
+  },
+  handler: async (ctx, args): Promise<QualificationLearningContext> => {
+    const queryText = buildWorkspaceMemorySearchQuery({
+      title: args.title,
+      briefIntro: args.briefIntro,
+      matchedKeywords: args.matchedKeywords,
+      additionalContext: args.evidenceHighlights,
+    });
+
+    const sharedContext = await buildWorkspaceMemoryContextFromStore(ctx, {
+      workspaceId: args.workspaceId,
+      userId: args.userId,
+      query: queryText || "qualification policy",
+      surface: "qualification",
+      prospectId: args.prospectId,
+    });
+
+    if (!hasWorkspaceMemorySearchQuery(queryText)) {
+      return {
+        queryText,
+        policyPrompt: sharedContext.prompt,
+        complianceInstructions: sharedContext.complianceInstructions,
+        relevantMemories: sharedContext.learnedMemories.map(
+          (memory) => memory.canonicalContent
+        ),
+        similarQualifiedCases: [],
+        similarDisqualifiedCases: [],
+      };
+    }
+
+    const [similarQualifiedCases, similarDisqualifiedCases] = await Promise.all(
+      [
+        ctx.runAction(internal.memory.searchWorkspaceMemoryNamespaceInternal, {
+          workspaceId: args.workspaceId,
+          namespace: "verified_wins",
+          query: queryText,
+          limit: 3,
+        }),
+        ctx.runAction(internal.memory.searchWorkspaceMemoryNamespaceInternal, {
+          workspaceId: args.workspaceId,
+          namespace: "verified_losses",
+          query: queryText,
+          limit: 3,
+        }),
+      ]
+    );
+
+    return {
+      queryText,
+      policyPrompt: sharedContext.prompt,
+      complianceInstructions: sharedContext.complianceInstructions,
+      relevantMemories: sharedContext.learnedMemories.map(
+        (memory) => memory.canonicalContent
+      ),
+      similarQualifiedCases: similarQualifiedCases.matches.map(
+        (match: WorkspaceSemanticMatch) => match.promptLine
+      ),
+      similarDisqualifiedCases: similarDisqualifiedCases.matches.map(
+        (match: WorkspaceSemanticMatch) => match.promptLine
+      ),
+    };
+  },
+});
+
+export const getOutreachLearningContextInternal = internalAction({
+  args: {
+    workspaceId: v.string(),
+    userId: v.string(),
+    platform: v.optional(v.union(v.literal("twitter"), v.literal("linkedin"))),
+    title: v.optional(v.string()),
+    briefIntro: v.optional(v.string()),
+    painPoints: v.optional(v.array(v.string())),
+    matchedKeywords: v.optional(v.array(v.string())),
+    finance: v.optional(v.string()),
+    prospectId: v.optional(v.string()),
+  },
+  handler: async (ctx, args): Promise<OutreachLearningContext> => {
+    const queryText = buildWorkspaceMemorySearchQuery({
+      title: args.title,
+      briefIntro: args.briefIntro,
+      painPoints: args.painPoints,
+      matchedKeywords: args.matchedKeywords,
+      finance: args.finance,
+    });
+
+    const sharedContext = await buildWorkspaceMemoryContextFromStore(ctx, {
+      workspaceId: args.workspaceId,
+      userId: args.userId,
+      query: queryText || "outreach policy",
+      surface: "manual_prospect",
+      prospectId: args.prospectId,
+      channel: args.platform,
+    });
+    const styleCategory = args.platform
+      ? getStyleMemoryCategory(args.platform)
+      : undefined;
+
+    return {
+      queryText,
+      policyPrompt: sharedContext.prompt,
+      relevantMemories: sharedContext.learnedMemories.map(
+        (memory) => memory.canonicalContent
+      ),
+      winningPatterns: sharedContext.learnedMemories
+        .filter((memory) => memory.ragNamespace === "wins")
+        .map((memory) => memory.canonicalContent),
+      objections: sharedContext.learnedMemories
+        .filter((memory) => memory.ragNamespace === "objections")
+        .map((memory) => memory.canonicalContent),
+      similarCases: [],
+      operatorPreferences: sharedContext.operatorInstructions.map(
+        (memory) => memory.instruction ?? memory.canonicalContent
+      ),
+      styleProfiles: sharedContext.learnedMemories
+        .filter((memory) => memory.category === styleCategory)
+        .map((memory) => memory.canonicalContent),
+    };
+  },
+});
+
+export const promoteQualificationLearningInternal = internalAction({
+  args: {
+    workspaceId: v.string(),
+    userId: v.string(),
+    workspaceName: v.string(),
+    workspaceDescription: v.string(),
+    useCaseKey: v.optional(v.string()),
+    prospectId: v.string(),
+    threadId: v.optional(v.string()),
+    prospectName: v.string(),
+    prospectTitle: v.optional(v.string()),
+    matchedKeywords: v.array(v.string()),
+    score: v.number(),
+    qualified: v.boolean(),
+    reasoning: v.string(),
+    evidenceHighlights: v.array(v.string()),
+    priorMemoryContext: v.optional(v.array(v.string())),
+    similarQualifiedCases: v.optional(v.array(v.string())),
+    similarDisqualifiedCases: v.optional(v.array(v.string())),
+  },
+  handler: async (ctx, args): Promise<AgentMemoryPromotionResult[]> => {
+    const drafts = await distillQualificationLearning({
+      workspaceName: args.workspaceName,
+      workspaceDescription: args.workspaceDescription,
+      useCaseKey: args.useCaseKey as WorkspaceUseCaseKey | undefined,
+      prospectName: args.prospectName,
+      prospectTitle: args.prospectTitle,
+      matchedKeywords: args.matchedKeywords,
+      score: args.score,
+      qualified: args.qualified,
+      reasoning: args.reasoning,
+      evidenceHighlights: args.evidenceHighlights,
+      priorMemoryContext: args.priorMemoryContext,
+      similarQualifiedCases: args.similarQualifiedCases,
+      similarDisqualifiedCases: args.similarDisqualifiedCases,
+    });
+
+    return await Promise.all(
+      drafts.map(
+        (draft): Promise<AgentMemoryPromotionResult> =>
+          persistWorkspaceMemoryDraft(ctx, {
+            userId: args.userId,
+            workspaceId: args.workspaceId,
+            category: draft.category,
+            source: "qualification",
+            title: draft.title,
+            summary: draft.summary,
+            confidence: draft.confidence,
+            impactScore: draft.impactScore,
+            prospectId: args.prospectId,
+            threadId: args.threadId,
+            signals: draft.signals,
+            evidence: draft.evidence,
+            relatedQueries: draft.relatedQueries,
+            narrative: draft.narrative,
+          })
+      )
+    );
+  },
+});
+
+export const promoteEnrichmentLearningInternal = internalAction({
+  args: {
+    workspaceId: v.string(),
+    userId: v.string(),
+    workspaceName: v.string(),
+    workspaceDescription: v.string(),
+    useCaseKey: v.optional(v.string()),
+    prospectId: v.string(),
+    prospectName: v.string(),
+    prospectTitle: v.optional(v.string()),
+    prospectType: v.optional(v.string()),
+    briefIntro: v.optional(v.string()),
+    financeSummary: v.optional(v.string()),
+    painPoints: v.array(v.string()),
+    relatedMemoryContext: v.optional(v.array(v.string())),
+  },
+  handler: async (ctx, args): Promise<AgentMemoryPromotionResult[]> => {
+    const drafts = await distillEnrichmentLearning({
+      workspaceName: args.workspaceName,
+      workspaceDescription: args.workspaceDescription,
+      useCaseKey: args.useCaseKey as WorkspaceUseCaseKey | undefined,
+      prospectName: args.prospectName,
+      prospectTitle: args.prospectTitle,
+      prospectType: args.prospectType,
+      briefIntro: args.briefIntro,
+      financeSummary: args.financeSummary,
+      painPoints: args.painPoints,
+      relatedMemoryContext: args.relatedMemoryContext,
+    });
+
+    return await Promise.all(
+      drafts.map(
+        (draft): Promise<AgentMemoryPromotionResult> =>
+          persistWorkspaceMemoryDraft(ctx, {
+            userId: args.userId,
+            workspaceId: args.workspaceId,
+            category: draft.category,
+            source: "enrichment",
+            title: draft.title,
+            summary: draft.summary,
+            confidence: draft.confidence,
+            impactScore: draft.impactScore,
+            prospectId: args.prospectId,
+            signals: draft.signals,
+            evidence: draft.evidence,
+            relatedQueries: draft.relatedQueries,
+            narrative: draft.narrative,
+          })
+      )
+    );
+  },
+});
+
+export const promoteOutreachLearningInternal = internalAction({
+  args: {
+    workspaceId: v.string(),
+    userId: v.string(),
+    workspaceName: v.string(),
+    workspaceDescription: v.string(),
+    useCaseKey: v.optional(v.string()),
+    prospectId: v.string(),
+    prospectName: v.string(),
+    prospectTitle: v.optional(v.string()),
+    briefIntro: v.optional(v.string()),
+    financeSummary: v.optional(v.string()),
+    painPoints: v.array(v.string()),
+    matchedKeywords: v.array(v.string()),
+    outcome: v.union(
+      v.literal("plan_approved"),
+      v.literal("plan_abandoned"),
+      v.literal("task_approved"),
+      v.literal("task_completed"),
+      v.literal("task_failed"),
+      v.literal("responded"),
+      v.literal("converted"),
+      v.literal("archived")
+    ),
+    planId: v.optional(v.string()),
+    threadId: v.optional(v.string()),
+    taskId: v.optional(v.string()),
+    planRationale: v.optional(v.string()),
+    planTone: v.optional(v.string()),
+    taskType: v.optional(v.string()),
+    taskContent: v.optional(v.string()),
+    responseText: v.optional(v.string()),
+    failureReason: v.optional(v.string()),
+    relevantMemories: v.optional(v.array(v.string())),
+    winningPatterns: v.optional(v.array(v.string())),
+    objections: v.optional(v.array(v.string())),
+    similarCases: v.optional(v.array(v.string())),
+  },
+  handler: async (ctx, args): Promise<AgentMemoryPromotionResult[]> => {
+    const drafts = await distillOutreachLearning({
+      workspaceName: args.workspaceName,
+      workspaceDescription: args.workspaceDescription,
+      useCaseKey: args.useCaseKey as WorkspaceUseCaseKey | undefined,
+      prospectName: args.prospectName,
+      prospectTitle: args.prospectTitle,
+      briefIntro: args.briefIntro,
+      financeSummary: args.financeSummary,
+      painPoints: args.painPoints,
+      matchedKeywords: args.matchedKeywords,
+      outcome: args.outcome,
+      planRationale: args.planRationale,
+      planTone: args.planTone,
+      taskType: args.taskType,
+      taskContent: args.taskContent,
+      responseText: args.responseText,
+      failureReason: args.failureReason,
+      relevantMemories: args.relevantMemories,
+      winningPatterns: args.winningPatterns,
+      objections: args.objections,
+      similarCases: args.similarCases,
+    });
+
+    return await Promise.all(
+      drafts.map((draft) =>
+        persistWorkspaceMemoryDraft(ctx, {
+          userId: args.userId,
+          workspaceId: args.workspaceId,
+          category: draft.category,
+          source: "outreach",
+          title: draft.title,
+          summary: draft.summary,
+          confidence: draft.confidence,
+          impactScore: draft.impactScore,
+          prospectId: args.prospectId,
+          threadId: args.threadId,
+          signals: draft.signals,
+          evidence: draft.evidence,
+          relatedQueries: draft.relatedQueries,
+          narrative: draft.narrative,
+        })
+      )
+    );
+  },
+});
+
+export const indexWorkspaceProspectSummaryInternal = internalAction({
+  args: {
+    targetingFingerprint: v.optional(v.string()),
+    workspaceId: v.string(),
+    prospectId: v.string(),
+    namespace: v.string(),
+    displayName: v.string(),
+    title: v.optional(v.string()),
+    briefIntro: v.optional(v.string()),
+    qualificationStatus: v.optional(v.string()),
+    qualificationScore: v.optional(v.number()),
+    matchedKeywords: v.optional(v.array(v.string())),
+    painPoints: v.optional(v.array(v.string())),
+    finance: v.optional(v.string()),
+    reasoning: v.optional(v.string()),
+    importance: v.optional(v.number()),
+  },
+  handler: async (ctx, args): Promise<{ indexed: boolean }> => {
+    const text = buildWorkspaceProspectSummaryText({
+      displayName: args.displayName,
+      title: args.title,
+      briefIntro: args.briefIntro,
+      qualificationStatus: args.qualificationStatus,
+      qualificationScore: args.qualificationScore,
+      matchedKeywords: args.matchedKeywords,
+      painPoints: args.painPoints,
+      finance: args.finance,
+      reasoning: args.reasoning,
+    });
+
+    return await indexWorkspaceProspectSummary(ctx, {
+      targetingFingerprint: args.targetingFingerprint,
+      workspaceId: args.workspaceId,
+      namespace: args.namespace as Parameters<typeof getWorkspaceNamespace>[1],
+      prospectId: args.prospectId,
+      title: args.title || args.displayName,
+      text,
+      importance: args.importance,
+    });
+  },
+});
+
+export const indexProspectSearchListInternal = internalAction({
+  args: { prospectId: v.id("prospects") },
+  handler: async (ctx, { prospectId }): Promise<{ indexed: boolean }> => {
+    const prospect = (await ctx.runQuery(
+      internal.prospects.getProspectInternal,
+      {
+        prospectId,
+      }
+    )) as Doc<"prospects"> | null;
+    if (!prospect) {
+      return { indexed: false };
+    }
+    return await indexProspectSearchListEntry(ctx, prospect);
+  },
+});
+
+export const indexQueryCandidateInternal = internalAction({
+  args: {
+    queryCandidateId: v.id("queryCandidates"),
+  },
+  handler: async (
+    ctx,
+    { queryCandidateId }
+  ): Promise<{ indexed: boolean; reason?: "not_found" }> => {
+    const candidate = (await ctx.runQuery(
+      internal.memory.getQueryCandidateByIdInternal,
+      { queryCandidateId }
+    )) as Doc<"queryCandidates"> | null;
+
+    if (!candidate) {
+      return { indexed: false, reason: "not_found" };
+    }
+
+    return await indexWorkspaceQueryCandidate(ctx, {
+      targetingFingerprint: candidate.targetingFingerprint,
+      queryCandidateId: String(candidate._id),
+      workspaceId: String(candidate.workspaceId),
+      embeddingDocKey: candidate.embeddingDocKey,
+      canonicalKey: candidate.canonicalKey,
+      type: candidate.type,
+      rawValue: candidate.rawValue,
+      canonicalValue: candidate.canonicalValue,
+      sourceTheme: candidate.sourceTheme,
+      status: candidate.status,
+      importance: candidate.performanceScore,
+    });
+  },
+});
+
+export const searchDiscoverySemanticDuplicatesInternal = internalAction({
+  args: {
+    workspaceId: v.id("workspaces"),
+    query: v.string(),
+    limit: v.optional(v.number()),
+  },
+  handler: async (
+    ctx,
+    { workspaceId, query, limit }
+  ): Promise<{
+    matches: Array<{ score: number; text: string; title: string | null }>;
+  }> => {
+    const namespace = getWorkspaceNamespace(
+      String(workspaceId),
+      getNamespaceKindForQueryCandidate()
+    );
+    const searchLimit = Math.min(
+      Math.max(
+        Math.floor(limit ?? DISCOVERY_SEMANTIC_DUPLICATE_RESULT_LIMIT),
+        1
+      ),
+      DISCOVERY_SEMANTIC_DUPLICATE_RESULT_LIMIT
+    );
+
+    const searchStartedAt = getCurrentUTCTimestamp();
+    try {
+      const result = await getAgentMemoryRag().search(ctx, {
+        namespace,
+        query,
+        filters: [{ name: "contentType", value: "query_candidate" }],
+        limit: searchLimit,
+        vectorScoreThreshold: DISCOVERY_SEMANTIC_DUPLICATE_THRESHOLD,
+      });
+      logRagSearch({
+        caller: "discovery_semantic_duplicate_screening",
+        workspaceId,
+        namespace,
+        limit: searchLimit,
+        resultCount: result.entries.length,
+        durationMs: getCurrentUTCTimestamp() - searchStartedAt,
+        outcome: "success",
+      });
+
+      const allowedIds = new Set(
+        await ctx.runQuery(
+          internal.memory.filterCurrentLearningEntriesInternal,
+          {
+            workspaceId,
+            namespace: "queries",
+            entries: result.entries.map((entry) => ({
+              entryId: entry.entryId,
+              targetingFingerprint: getStringProperty(
+                isRecord(entry.metadata) ? entry.metadata : undefined,
+                "targetingFingerprint"
+              ),
+              sourceId: getStringProperty(
+                isRecord(entry.metadata) ? entry.metadata : undefined,
+                "queryCandidateId"
+              ),
+            })),
+          }
+        )
+      );
+      return {
+        matches: result.results
+          .filter((entry) => allowedIds.has(entry.entryId))
+          .slice(0, searchLimit)
+          .map((entry) => ({
+            score: entry.score,
+            text: entry.content.map((chunk) => chunk.text).join("\n"),
+            title: null,
+          })),
+      };
+    } catch (error) {
+      logRagSearch({
+        caller: "discovery_semantic_duplicate_screening",
+        workspaceId,
+        namespace,
+        limit: searchLimit,
+        resultCount: 0,
+        durationMs: getCurrentUTCTimestamp() - searchStartedAt,
+        outcome: "error",
+      });
+      memoryLogger.warn("Discovery semantic duplicate search failed", {
+        workspaceId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { matches: [] };
+    }
+  },
+});
+
+export const screenDiscoveryQueryCandidatesInternal = internalAction({
+  args: {
+    expectedTargetingFingerprint: v.optional(v.string()),
+    workspaceId: v.id("workspaces"),
+    candidates: v.array(
+      v.object({
+        rawValue: v.string(),
+        sourceTheme: v.optional(v.string()),
+      })
+    ),
+  },
+  handler: async (
+    ctx,
+    { workspaceId, candidates, expectedTargetingFingerprint }
+  ): Promise<{
+    accepted: Array<{
+      rawValue: string;
+      sourceTheme?: string;
+      queryCandidateId: Doc<"queryCandidates">["_id"];
+    }>;
+    rejected: Array<{
+      rawValue: string;
+      sourceTheme?: string;
+      reason: "exact_duplicate" | "semantic_duplicate";
+      noveltyScore: number;
+      queryCandidateId: Doc<"queryCandidates">["_id"];
+      semanticMatches?: Array<{
+        score: number;
+        text: string;
+        title: string | null;
+      }>;
+    }>;
+    counts: {
+      generated: number;
+      accepted: number;
+      exactDuplicates: number;
+      semanticDuplicates: number;
+    };
+  }> => {
+    const accepted: Array<{
+      rawValue: string;
+      sourceTheme?: string;
+      queryCandidateId: Doc<"queryCandidates">["_id"];
+    }> = [];
+    const rejected: Array<{
+      rawValue: string;
+      sourceTheme?: string;
+      reason: "exact_duplicate" | "semantic_duplicate";
+      noveltyScore: number;
+      queryCandidateId: Doc<"queryCandidates">["_id"];
+      semanticMatches?: Array<{
+        score: number;
+        text: string;
+        title: string | null;
+      }>;
+    }> = [];
+    const seenCanonicalHashes = new Set<string>();
+
+    for (const candidate of candidates) {
+      const canonical = buildQueryCandidateCanonicalRecord({
+        type: "social_query",
+        value: candidate.rawValue,
+      });
+
+      let isExactDuplicate = seenCanonicalHashes.has(canonical.canonicalHash);
+      seenCanonicalHashes.add(canonical.canonicalHash);
+      const existingKeyword = await ctx.runQuery(
+        internal.keywords.getKeywordByCanonicalHashInternal,
+        {
+          workspaceId,
+          canonicalHash: canonical.canonicalHash,
+        }
+      );
+      if (existingKeyword) {
+        isExactDuplicate = true;
+      }
+
+      if (!isExactDuplicate) {
+        const existingCandidate = await ctx.runQuery(
+          internal.memory.getQueryCandidateByCanonicalKeyInternal,
+          {
+            workspaceId,
+            canonicalKey: canonical.canonicalKey,
+          }
+        );
+        if (existingCandidate?.status === "generated") {
+          accepted.push({
+            rawValue: candidate.rawValue,
+            sourceTheme: candidate.sourceTheme,
+            queryCandidateId: existingCandidate._id,
+          });
+          continue;
+        }
+        if (existingCandidate) {
+          isExactDuplicate = true;
+        }
+      }
+
+      if (isExactDuplicate) {
+        const duplicate = await ctx.runMutation(
+          internal.memory.upsertQueryCandidateInternal,
+          {
+            workspaceId,
+            expectedTargetingFingerprint,
+            type: "social_query",
+            rawValue: candidate.rawValue,
+            sourceTheme: candidate.sourceTheme,
+            status: "rejected_exact_duplicate",
+            duplicateReason: "canonical_match",
+            noveltyScore: 0,
+          }
+        );
+        rejected.push({
+          rawValue: candidate.rawValue,
+          sourceTheme: candidate.sourceTheme,
+          reason: "exact_duplicate",
+          noveltyScore: 0,
+          queryCandidateId: duplicate.queryCandidateId,
+        });
+        continue;
+      }
+
+      const semantic = await ctx.runAction(
+        internal.memory.searchDiscoverySemanticDuplicatesInternal,
+        {
+          workspaceId,
+          query: candidate.rawValue,
+          limit: 3,
+        }
+      );
+
+      if (semantic.matches.length > 0) {
+        const topScore =
+          semantic.matches[0]?.score ?? DISCOVERY_SEMANTIC_DUPLICATE_THRESHOLD;
+        const duplicate = await ctx.runMutation(
+          internal.memory.upsertQueryCandidateInternal,
+          {
+            workspaceId,
+            expectedTargetingFingerprint,
+            type: "social_query",
+            rawValue: candidate.rawValue,
+            sourceTheme: candidate.sourceTheme,
+            status: "rejected_semantic_duplicate",
+            duplicateReason: "semantic_match",
+            noveltyScore: Math.max(0, 1 - topScore),
+          }
+        );
+        rejected.push({
+          rawValue: candidate.rawValue,
+          sourceTheme: candidate.sourceTheme,
+          reason: "semantic_duplicate",
+          noveltyScore: Math.max(0, 1 - topScore),
+          queryCandidateId: duplicate.queryCandidateId,
+          semanticMatches: semantic.matches,
+        });
+        continue;
+      }
+
+      const unique = await ctx.runMutation(
+        internal.memory.upsertQueryCandidateInternal,
+        {
+          workspaceId,
+          expectedTargetingFingerprint,
+          type: "social_query",
+          rawValue: candidate.rawValue,
+          sourceTheme: candidate.sourceTheme,
+          status: "generated",
+          noveltyScore: 1,
+        }
+      );
+      accepted.push({
+        rawValue: candidate.rawValue,
+        sourceTheme: candidate.sourceTheme,
+        queryCandidateId: unique.queryCandidateId,
+      });
+    }
+
+    return {
+      accepted,
+      rejected,
+      counts: {
+        generated: candidates.length,
+        accepted: accepted.length,
+        exactDuplicates: rejected.filter(
+          (item) => item.reason === "exact_duplicate"
+        ).length,
+        semanticDuplicates: rejected.filter(
+          (item) => item.reason === "semantic_duplicate"
+        ).length,
+      },
+    };
+  },
+});
+
+export const getWorkspaceMemoryOverview = query({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (ctx, { workspaceId }) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    await requireOwnedWorkspace(ctx, workspaceId, {
+      user,
+      notFoundMessage: "Workspace not found",
+      notAuthorizedMessage: "Workspace not found",
+    });
+
+    const [
+      activeCandidates,
+      rejectedCandidates,
+      retiredCandidates,
+      pendingEvents,
+      processingEvents,
+      failedEvents,
+      recentEvent,
+      pendingSuggestions,
+      runningEvaluatorRuns,
+      failedEvaluatorRuns,
+    ] = await Promise.all([
+      ctx.db
+        .query("queryCandidates")
+        .withIndex("by_workspace_status", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "activated")
+        )
+        .collect(),
+      Promise.all([
+        ctx.db
+          .query("queryCandidates")
+          .withIndex("by_workspace_status", (q) =>
+            q
+              .eq("workspaceId", workspaceId)
+              .eq("status", "rejected_exact_duplicate")
+          )
+          .collect(),
+        ctx.db
+          .query("queryCandidates")
+          .withIndex("by_workspace_status", (q) =>
+            q
+              .eq("workspaceId", workspaceId)
+              .eq("status", "rejected_semantic_duplicate")
+          )
+          .collect(),
+        ctx.db
+          .query("queryCandidates")
+          .withIndex("by_workspace_status", (q) =>
+            q
+              .eq("workspaceId", workspaceId)
+              .eq("status", "rejected_low_novelty")
+          )
+          .collect(),
+      ]).then((groups) => groups.flat()),
+      ctx.db
+        .query("queryCandidates")
+        .withIndex("by_workspace_status", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "retired")
+        )
+        .collect(),
+      ctx.db
+        .query("memoryWorkflowEvents")
+        .withIndex("by_workspace_status_occurred_at", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "pending")
+        )
+        .collect(),
+      ctx.db
+        .query("memoryWorkflowEvents")
+        .withIndex("by_workspace_status_occurred_at", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "processing")
+        )
+        .collect(),
+      ctx.db
+        .query("memoryWorkflowEvents")
+        .withIndex("by_workspace_status_occurred_at", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "failed")
+        )
+        .collect(),
+      ctx.db
+        .query("memoryWorkflowEvents")
+        .withIndex("by_workspace_occurred_at", (q) =>
+          q.eq("workspaceId", workspaceId)
+        )
+        .order("desc")
+        .first(),
+      ctx.db
+        .query("memorySuggestions")
+        .withIndex("by_workspace_status_updated_at", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "pending_review")
+        )
+        .collect(),
+      ctx.db
+        .query("memoryEvaluatorRuns")
+        .withIndex("by_workspace_status_updated_at", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "running")
+        )
+        .collect(),
+      ctx.db
+        .query("memoryEvaluatorRuns")
+        .withIndex("by_workspace_status_updated_at", (q) =>
+          q.eq("workspaceId", workspaceId).eq("status", "failed")
+        )
+        .collect(),
+    ]);
+
+    return {
+      queryCandidates: {
+        activated: activeCandidates.length,
+        rejected: rejectedCandidates.length,
+        retired: retiredCandidates.length,
+      },
+      workflowEvents: {
+        pending: pendingEvents.length,
+        processing: processingEvents.length,
+        failed: failedEvents.length,
+        latestOccurredAt: recentEvent?.occurredAt ?? null,
+      },
+      suggestions: {
+        pendingReview: pendingSuggestions.length,
+      },
+      evaluatorRuns: {
+        running: runningEvaluatorRuns.length,
+        failed: failedEvaluatorRuns.length,
+      },
+    };
+  },
+});
+
+export const listWorkspaceQueryCandidates = query({
+  args: {
+    workspaceId: v.id("workspaces"),
+    status: v.optional(queryCandidateStatusValidator),
+    type: v.optional(queryCandidateTypeValidator),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, { workspaceId, status, type, limit }) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    await requireOwnedWorkspace(ctx, workspaceId, {
+      user,
+      notFoundMessage: "Workspace not found",
+      notAuthorizedMessage: "Workspace not found",
+    });
+
+    const rows = await ctx.db
+      .query("queryCandidates")
+      .withIndex("by_workspace_updated_at", (q) =>
+        q.eq("workspaceId", workspaceId)
+      )
+      .order("desc")
+      .take(MAX_LIST_LIMIT);
+
+    return rows
+      .filter(
+        (candidate) =>
+          matchesOptionalFilter(candidate.status, status) &&
+          matchesOptionalFilter(candidate.type, type)
+      )
+      .slice(0, toListLimit(limit));
+  },
+});
+
+export const listWorkspaceMemoryWorkflowEvents = query({
+  args: {
+    workspaceId: v.id("workspaces"),
+    status: v.optional(memoryWorkflowEventStatusValidator),
+    eventType: v.optional(memoryWorkflowEventTypeValidator),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, { workspaceId, status, eventType, limit }) => {
+    const user = await requireUser(ctx, { notFoundMessage: "User not found" });
+    await requireOwnedWorkspace(ctx, workspaceId, {
+      user,
+      notFoundMessage: "Workspace not found",
+      notAuthorizedMessage: "Workspace not found",
+    });
+
+    const rows = await ctx.db
+      .query("memoryWorkflowEvents")
+      .withIndex("by_workspace_occurred_at", (q) =>
+        q.eq("workspaceId", workspaceId)
+      )
+      .order("desc")
+      .take(MAX_LIST_LIMIT);
+
+    return rows
+      .filter(
+        (event) =>
+          matchesOptionalFilter(event.status, status) &&
+          matchesOptionalFilter(event.eventType, eventType)
+      )
+      .slice(0, toListLimit(limit));
+  },
+});
+
+export const backfillWorkspaceDiscoveryMemory = action({
+  args: {
+    workspaceId: v.id("workspaces"),
+  },
+  handler: async (
+    ctx,
+    { workspaceId }
+  ): Promise<{
+    candidateCount: number;
+    performanceCount: number;
+    keywordCount: number;
+  }> => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      throw new Error("Not authenticated");
+    }
+
+    const user = await ctx.runQuery(internal.users.getUserByWorkosIdInternal, {
+      workosUserId: identity.subject,
+    });
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const workspace = await ctx.runQuery(internal.workspaces.getById, {
+      workspaceId,
+    });
+    if (!workspace || workspace.userId !== user._id) {
+      throw new Error("Workspace not found");
+    }
+
+    const keywords = (await ctx.runQuery(
+      internal.keywords.getWorkspaceKeywordsInternal,
+      {
+        workspaceId,
+      }
+    )) as { _raw: Doc<"keywords">[] };
+    const rawKeywords = keywords._raw;
+
+    let candidateCount = 0;
+    let performanceCount = 0;
+
+    for (const keyword of rawKeywords) {
+      const candidateType =
+        keyword.type === "social_query" ? "social_query" : "seed_keyword";
+      const derivedCanonical = buildKeywordCanonicalRecord({
+        type: keyword.type,
+        value: keyword.originalValue ?? keyword.value,
+      });
+      const canonicalValue =
+        keyword.canonicalValue ?? derivedCanonical.canonicalValue;
+      const canonicalHash =
+        keyword.canonicalHash ?? derivedCanonical.canonicalHash;
+      const candidate = await ctx.runMutation(
+        internal.memory.upsertQueryCandidateInternal,
+        {
+          workspaceId,
+          type: candidateType,
+          rawValue: keyword.originalValue ?? keyword.value,
+          status: "activated",
+          activatedKeywordId: keyword._id,
+        }
+      );
+      candidateCount += candidate.created ? 1 : 0;
+
+      await ctx.runMutation(internal.memory.upsertQueryPerformanceInternal, {
+        workspaceId,
+        queryId: keyword._id,
+        canonicalValue,
+        canonicalHash,
+        activatedQueryCandidateId: candidate.queryCandidateId,
+        prospectsFoundDelta: 0,
+        lastUsedAt: keyword.lastUsedAt,
+      });
+      performanceCount += 1;
+    }
+
+    return {
+      candidateCount,
+      performanceCount,
+      keywordCount: rawKeywords.length,
+    };
+  },
+});

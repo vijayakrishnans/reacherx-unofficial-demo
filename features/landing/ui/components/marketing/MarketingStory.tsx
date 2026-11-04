@@ -1,0 +1,145 @@
+import { MARKETING_COPY } from "@/features/landing/lib/marketingContentHelpers";
+import Link from "next/link";
+import type { ReactNode } from "react";
+import { GITHUB_REPO_URL } from "@/features/landing/lib/github";
+import {
+  DISCORD_INVITE_URL,
+  CONVEX_OPEN_SOURCE_PROGRAM_URL,
+  PATREON_URL,
+} from "@/features/landing/lib/communityUrls";
+import {
+  ArrowOutwardIcon,
+  ConvexLogoIcon,
+  DiscordOutlineIcon,
+  PatreonIcon,
+} from "@/shared/ui/components/icons";
+import {
+  marketingButton,
+  highlightTerms,
+  MarketingSection,
+  marketingSectionTitle,
+} from "./MarketingLayout";
+
+/** Key phrases emphasized in the open-source paragraph, in text order. */
+const DEVELOPER_HIGHLIGHTS = [
+  "Convex",
+  "Convex Open Source program",
+  "AGPL-3.0",
+] as const;
+
+export function MarketingAuthenticity() {
+  return (
+    <MarketingSection labelledBy="authenticity-heading">
+      <h2 id="authenticity-heading" className={marketingSectionTitle}>
+        {MARKETING_COPY.story.authenticityHeading}
+      </h2>
+    </MarketingSection>
+  );
+}
+
+export function MarketingDevelopers() {
+  return (
+    <MarketingSection labelledBy="developers-heading">
+      <div className="flex flex-col justify-between gap-10 lg:flex-row lg:items-center">
+        <div>
+          <h2 id="developers-heading" className={marketingSectionTitle}>
+            {MARKETING_COPY.story.developersHeading}
+          </h2>
+          <p className="text-muted-foreground mt-5 max-w-lg text-base leading-7">
+            {highlightTerms(
+              MARKETING_COPY.story.developers,
+              DEVELOPER_HIGHLIGHTS
+            )}
+          </p>
+          <a
+            href={CONVEX_OPEN_SOURCE_PROGRAM_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Convex Open Source program"
+            className="text-foreground hover:text-muted-foreground mt-7 inline-flex w-fit transition-colors"
+          >
+            <ConvexLogoIcon className="h-10 w-auto" aria-hidden="true" />
+          </a>
+        </div>
+        <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap">
+          <a href={GITHUB_REPO_URL} className={marketingButton()}>
+            View on GitHub
+            <ArrowOutwardIcon className="size-4 shrink-0 fill-current" />
+          </a>
+          <Link
+            href="/blog/run-reacherx-yourself"
+            className={marketingButton({ variant: "outline" })}
+          >
+            Self-hosting guide
+            <ArrowOutwardIcon className="size-4 shrink-0 fill-current" />
+          </Link>
+        </div>
+      </div>
+    </MarketingSection>
+  );
+}
+
+export function MarketingCommunity() {
+  return (
+    <MarketingSection labelledBy="community-heading">
+      <header className="mb-10">
+        <h2 id="community-heading" className={marketingSectionTitle}>
+          {MARKETING_COPY.story.communityHeading}
+        </h2>
+      </header>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <CommunityCard
+          href={DISCORD_INVITE_URL}
+          icon={<DiscordOutlineIcon className="size-6" />}
+          title="Talk to us on Discord"
+          description="Ask questions, share what you build, and follow the roadmap with the people using it every day."
+          linkLabel="Join the Discord"
+        />
+        <CommunityCard
+          href={PATREON_URL}
+          icon={<PatreonIcon className="size-6 fill-current" />}
+          title="Support on Patreon"
+          description="Fund development and keep ReacherX independent, open source, and free to self-host."
+          linkLabel="Become a patron"
+        />
+      </div>
+    </MarketingSection>
+  );
+}
+
+function CommunityCard({
+  href,
+  icon,
+  title,
+  description,
+  linkLabel,
+}: {
+  href: string;
+  icon: ReactNode;
+  title: string;
+  description: string;
+  linkLabel: string;
+}) {
+  return (
+    <div className="blog-card bg-background relative flex h-full min-w-0 flex-col p-6 transition-colors duration-200 hover:bg-neutral-50 motion-reduce:transition-none lg:p-8 dark:bg-neutral-950 dark:hover:bg-neutral-900">
+      <div className="mb-5" aria-hidden="true">
+        {icon}
+      </div>
+      <h3 className="text-2xl leading-8 font-normal">{title}</h3>
+      <p className="text-muted-foreground mt-4 text-base leading-7">
+        {description}
+      </p>
+      <div className="mt-auto pt-6">
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={marketingButton({ size: "sm" })}
+        >
+          {linkLabel}
+          <ArrowOutwardIcon className="size-4 shrink-0 fill-current" />
+        </a>
+      </div>
+    </div>
+  );
+}

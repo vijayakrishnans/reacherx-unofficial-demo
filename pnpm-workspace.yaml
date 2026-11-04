@@ -1,0 +1,15 @@
+allowBuilds:
+  workerd: true
+  core-js: false
+  esbuild: true
+  sharp: true
+  unrs-resolver: true
+minimumReleaseAgeExclude:
+  - "@convex-dev/aggregate@0.3.0"
+patchedDependencies:
+  "@convex-dev/action-retrier@0.3.1": patches/@convex-dev__action-retrier@0.3.1.patch
+  "@xdevplatform/chat-xdk@0.5.0": patches/@xdevplatform__chat-xdk@0.5.0.patch
+  next-themes@0.4.6: patches/next-themes@0.4.6.patch
+
+overrides:
+  esbuild: 0.28.2

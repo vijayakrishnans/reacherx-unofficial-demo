@@ -1,0 +1,1095 @@
+import type { Doc, Id } from "../_generated/dataModel";
+import type { WorkspaceAgentMemoryRecord } from "./agentMemoryCore";
+import { HIGH_IMPACT_MEMORY_THRESHOLD } from "./agentOpsHelpers";
+import {
+  createEmptyHourlyAnalyticsCounts,
+  getUtcDayKeyFromStart,
+  getUtcDayStartTimestamp,
+  getUtcHourIndex,
+} from "./readModelHelpers";
+import { buildQueryCandidateCanonicalRecord } from "./memoryHelpers";
+import { getNumberProperty, isRecord } from "./typeGuards";
+import { getCurrentUTCTimestamp } from "../../shared/lib/utils/time/timeUtils";
+
+const AGENT_OPS_NUMERIC_FIELDS = [
+  "keywordsCreatedCount",
+  "queriesGeneratedCount",
+  "queriesReviewedCount",
+  "queriesActivatedCount",
+  "queriesRejectedExactDuplicateCount",
+  "queriesRejectedSemanticDuplicateCount",
+  "suggestionsCreatedCount",
+  "suggestionsPendingReviewCount",
+  "suggestionsPromotedCount",
+  "suggestionsRejectedCount",
+  "memoriesWrittenCount",
+  "highImpactMemoriesCount",
+  "memoryImpactScoreSum",
+  "memoryConfidenceSum",
+  "eventsReceivedCount",
+  "failedEventsCount",
+  "runsStartedCount",
+  "failedRunsCount",
+  "qualificationCompletedCount",
+  "qualificationQualifiedCount",
+  "enrichmentCompletedCount",
+  "enrichmentPainPointCountSum",
+  "outreachTaskApprovedCount",
+  "outreachTaskApprovedEditedCount",
+] as const;
+
+export const AGENT_OPS_HOURLY_FIELDS = [
+  "hourlyKeywordsCreatedCounts",
+  "hourlyQueriesGeneratedCounts",
+  "hourlyQueriesReviewedCounts",
+  "hourlyQueriesActivatedCounts",
+  "hourlyQueriesRejectedExactDuplicateCounts",
+  "hourlyQueriesRejectedSemanticDuplicateCounts",
+  "hourlySuggestionsCreatedCounts",
+  "hourlySuggestionsPendingReviewCounts",
+  "hourlySuggestionsPromotedCounts",
+  "hourlySuggestionsRejectedCounts",
+  "hourlyMemoriesWrittenCounts",
+  "hourlyHighImpactMemoriesCounts",
+  "hourlyMemoryImpactScoreSums",
+  "hourlyMemoryConfidenceSums",
+  "hourlyEventsReceivedCounts",
+  "hourlyFailedEventsCounts",
+  "hourlyRunsStartedCounts",
+  "hourlyFailedRunsCounts",
+  "hourlyQualificationCompletedCounts",
+  "hourlyQualificationQualifiedCounts",
+  "hourlyEnrichmentCompletedCounts",
+  "hourlyEnrichmentPainPointCountSums",
+  "hourlyOutreachTaskApprovedCounts",
+  "hourlyOutreachTaskApprovedEditedCounts",
+] as const;
+
+const QUERY_PERFORMANCE_NUMERIC_FIELDS = [
+  "impressionsCount",
+  "prospectsFoundCount",
+  "qualifiedCount",
+  "convertedCount",
+  "replyCount",
+] as const;
+
+const QUERY_PERFORMANCE_HOURLY_FIELDS = [
+  "hourlyImpressionsCounts",
+  "hourlyProspectsFoundCounts",
+  "hourlyQualifiedCounts",
+  "hourlyConvertedCounts",
+  "hourlyReplyCounts",
+] as const;
+
+type AgentOpsNumericField = (typeof AGENT_OPS_NUMERIC_FIELDS)[number];
+type AgentOpsHourlyField = (typeof AGENT_OPS_HOURLY_FIELDS)[number];
+type QueryPerformanceNumericField =
+  (typeof QUERY_PERFORMANCE_NUMERIC_FIELDS)[number];
+type QueryPerformanceHourlyField =
+  (typeof QUERY_PERFORMANCE_HOURLY_FIELDS)[number];
+
+export interface WorkspaceAgentOpsDailyContribution {
+  keywordsCreatedCount: number;
+  queriesGeneratedCount: number;
+  queriesReviewedCount: number;
+  queriesActivatedCount: number;
+  queriesRejectedExactDuplicateCount: number;
+  queriesRejectedSemanticDuplicateCount: number;
+  suggestionsCreatedCount: number;
+  suggestionsPendingReviewCount: number;
+  suggestionsPromotedCount: number;
+  suggestionsRejectedCount: number;
+  memoriesWrittenCount: number;
+  highImpactMemoriesCount: number;
+  memoryImpactScoreSum: number;
+  memoryConfidenceSum: number;
+  eventsReceivedCount: number;
+  failedEventsCount: number;
+  runsStartedCount: number;
+  failedRunsCount: number;
+  qualificationCompletedCount: number;
+  qualificationQualifiedCount: number;
+  enrichmentCompletedCount: number;
+  enrichmentPainPointCountSum: number;
+  outreachTaskApprovedCount: number;
+  outreachTaskApprovedEditedCount: number;
+  hourlyKeywordsCreatedCounts: number[];
+  hourlyQueriesGeneratedCounts: number[];
+  hourlyQueriesReviewedCounts: number[];
+  hourlyQueriesActivatedCounts: number[];
+  hourlyQueriesRejectedExactDuplicateCounts: number[];
+  hourlyQueriesRejectedSemanticDuplicateCounts: number[];
+  hourlySuggestionsCreatedCounts: number[];
+  hourlySuggestionsPendingReviewCounts: number[];
+  hourlySuggestionsPromotedCounts: number[];
+  hourlySuggestionsRejectedCounts: number[];
+  hourlyMemoriesWrittenCounts: number[];
+  hourlyHighImpactMemoriesCounts: number[];
+  hourlyMemoryImpactScoreSums: number[];
+  hourlyMemoryConfidenceSums: number[];
+  hourlyEventsReceivedCounts: number[];
+  hourlyFailedEventsCounts: number[];
+  hourlyRunsStartedCounts: number[];
+  hourlyFailedRunsCounts: number[];
+  hourlyQualificationCompletedCounts: number[];
+  hourlyQualificationQualifiedCounts: number[];
+  hourlyEnrichmentCompletedCounts: number[];
+  hourlyEnrichmentPainPointCountSums: number[];
+  hourlyOutreachTaskApprovedCounts: number[];
+  hourlyOutreachTaskApprovedEditedCounts: number[];
+}
+
+export interface WorkspaceAgentOpsDailyRecord extends WorkspaceAgentOpsDailyContribution {
+  workspaceId: Id<"workspaces">;
+  dayStartUtcMs: number;
+  dayKey: string;
+  updatedAt: number;
+}
+
+export interface TargetedWorkspaceAgentOpsContribution {
+  workspaceId: Id<"workspaces">;
+  dayStartUtcMs: number;
+  contribution: WorkspaceAgentOpsDailyContribution;
+}
+
+export interface WorkspaceQueryPerformanceDailyRecord {
+  workspaceId: Id<"workspaces">;
+  queryId: Id<"keywords">;
+  activatedQueryCandidateId?: Id<"queryCandidates">;
+  dayStartUtcMs: number;
+  dayKey: string;
+  impressionsCount: number;
+  prospectsFoundCount: number;
+  qualifiedCount: number;
+  convertedCount: number;
+  replyCount: number;
+  hourlyImpressionsCounts: number[];
+  hourlyProspectsFoundCounts: number[];
+  hourlyQualifiedCounts: number[];
+  hourlyConvertedCounts: number[];
+  hourlyReplyCounts: number[];
+  updatedAt: number;
+}
+
+export interface WorkspaceQueryPerformanceDailyDelta {
+  workspaceId: Id<"workspaces">;
+  queryId: Id<"keywords">;
+  activatedQueryCandidateId?: Id<"queryCandidates">;
+  timestamp: number;
+  impressionsDelta?: number;
+  prospectsFoundDelta?: number;
+  qualifiedCountDelta?: number;
+  convertedCountDelta?: number;
+  replyCountDelta?: number;
+}
+
+function createEmptyAgentOpsContribution(): WorkspaceAgentOpsDailyContribution {
+  return {
+    keywordsCreatedCount: 0,
+    queriesGeneratedCount: 0,
+    queriesReviewedCount: 0,
+    queriesActivatedCount: 0,
+    queriesRejectedExactDuplicateCount: 0,
+    queriesRejectedSemanticDuplicateCount: 0,
+    suggestionsCreatedCount: 0,
+    suggestionsPendingReviewCount: 0,
+    suggestionsPromotedCount: 0,
+    suggestionsRejectedCount: 0,
+    memoriesWrittenCount: 0,
+    highImpactMemoriesCount: 0,
+    memoryImpactScoreSum: 0,
+    memoryConfidenceSum: 0,
+    eventsReceivedCount: 0,
+    failedEventsCount: 0,
+    runsStartedCount: 0,
+    failedRunsCount: 0,
+    qualificationCompletedCount: 0,
+    qualificationQualifiedCount: 0,
+    enrichmentCompletedCount: 0,
+    enrichmentPainPointCountSum: 0,
+    outreachTaskApprovedCount: 0,
+    outreachTaskApprovedEditedCount: 0,
+    hourlyKeywordsCreatedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyQueriesGeneratedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyQueriesReviewedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyQueriesActivatedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyQueriesRejectedExactDuplicateCounts:
+      createEmptyHourlyAnalyticsCounts(),
+    hourlyQueriesRejectedSemanticDuplicateCounts:
+      createEmptyHourlyAnalyticsCounts(),
+    hourlySuggestionsCreatedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlySuggestionsPendingReviewCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlySuggestionsPromotedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlySuggestionsRejectedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyMemoriesWrittenCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyHighImpactMemoriesCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyMemoryImpactScoreSums: createEmptyHourlyAnalyticsCounts(),
+    hourlyMemoryConfidenceSums: createEmptyHourlyAnalyticsCounts(),
+    hourlyEventsReceivedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyFailedEventsCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyRunsStartedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyFailedRunsCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyQualificationCompletedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyQualificationQualifiedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyEnrichmentCompletedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyEnrichmentPainPointCountSums: createEmptyHourlyAnalyticsCounts(),
+    hourlyOutreachTaskApprovedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyOutreachTaskApprovedEditedCounts: createEmptyHourlyAnalyticsCounts(),
+  };
+}
+
+export function createEmptyWorkspaceAgentOpsDailyRecord(args: {
+  workspaceId: Id<"workspaces">;
+  dayStartUtcMs: number;
+}): WorkspaceAgentOpsDailyRecord {
+  return {
+    workspaceId: args.workspaceId,
+    dayStartUtcMs: args.dayStartUtcMs,
+    dayKey: getUtcDayKeyFromStart(args.dayStartUtcMs),
+    updatedAt: 0,
+    ...createEmptyAgentOpsContribution(),
+  };
+}
+
+export function normalizeWorkspaceAgentOpsDailyRecord(
+  existing: WorkspaceAgentOpsDailyRecord | Doc<"workspaceAgentOpsDaily">
+): WorkspaceAgentOpsDailyRecord {
+  const base = createEmptyWorkspaceAgentOpsDailyRecord({
+    workspaceId: existing.workspaceId,
+    dayStartUtcMs: existing.dayStartUtcMs,
+  });
+  const next: WorkspaceAgentOpsDailyRecord = {
+    ...base,
+    ...existing,
+    workspaceId: existing.workspaceId,
+    dayStartUtcMs: existing.dayStartUtcMs,
+    dayKey: existing.dayKey ?? base.dayKey,
+    updatedAt: existing.updatedAt ?? base.updatedAt,
+  };
+
+  for (const field of AGENT_OPS_NUMERIC_FIELDS) {
+    const value = isRecord(existing) ? existing[field] : undefined;
+    next[field] =
+      typeof value === "number" && Number.isFinite(value) ? value : 0;
+  }
+
+  for (const field of AGENT_OPS_HOURLY_FIELDS) {
+    const value = isRecord(existing) ? existing[field] : undefined;
+    next[field] =
+      Array.isArray(value) && value.length === base[field].length
+        ? value.map((entry) =>
+            typeof entry === "number" && Number.isFinite(entry) ? entry : 0
+          )
+        : [...base[field]];
+  }
+
+  return next;
+}
+
+function normalizeSignedWorkspaceAgentOpsDailyRecord(
+  existing: WorkspaceAgentOpsDailyRecord
+): WorkspaceAgentOpsDailyRecord {
+  const next = createEmptyWorkspaceAgentOpsDailyRecord({
+    workspaceId: existing.workspaceId,
+    dayStartUtcMs: existing.dayStartUtcMs,
+  });
+
+  for (const field of AGENT_OPS_NUMERIC_FIELDS) {
+    const value = existing[field];
+    next[field] = Number.isFinite(value) ? value : 0;
+  }
+  for (const field of AGENT_OPS_HOURLY_FIELDS) {
+    const values = existing[field];
+    next[field] = createEmptyHourlyAnalyticsCounts().map((_, index) => {
+      const value = values?.[index];
+      return Number.isFinite(value) ? (value ?? 0) : 0;
+    });
+  }
+
+  next.dayKey = existing.dayKey;
+  next.updatedAt = existing.updatedAt;
+  return next;
+}
+
+function createEmptyWorkspaceQueryPerformanceDailyRecord(args: {
+  workspaceId: Id<"workspaces">;
+  queryId: Id<"keywords">;
+  activatedQueryCandidateId?: Id<"queryCandidates">;
+  dayStartUtcMs: number;
+}): WorkspaceQueryPerformanceDailyRecord {
+  return {
+    workspaceId: args.workspaceId,
+    queryId: args.queryId,
+    activatedQueryCandidateId: args.activatedQueryCandidateId,
+    dayStartUtcMs: args.dayStartUtcMs,
+    dayKey: getUtcDayKeyFromStart(args.dayStartUtcMs),
+    impressionsCount: 0,
+    prospectsFoundCount: 0,
+    qualifiedCount: 0,
+    convertedCount: 0,
+    replyCount: 0,
+    hourlyImpressionsCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyProspectsFoundCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyQualifiedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyConvertedCounts: createEmptyHourlyAnalyticsCounts(),
+    hourlyReplyCounts: createEmptyHourlyAnalyticsCounts(),
+    updatedAt: 0,
+  };
+}
+
+function addHourlyValue(counts: number[], hour: number, delta: number) {
+  if (hour < 0 || hour >= counts.length) {
+    return counts;
+  }
+  const next = [...counts];
+  next[hour] = Math.max(0, next[hour] + delta);
+  return next;
+}
+
+function applyTimedAgentOpsValue(
+  contribution: WorkspaceAgentOpsDailyContribution,
+  timestamp: number,
+  numericField: AgentOpsNumericField,
+  hourlyField: AgentOpsHourlyField,
+  delta: number
+) {
+  const hour = getUtcHourIndex(timestamp);
+  contribution[numericField] = Math.max(0, contribution[numericField] + delta);
+  contribution[hourlyField] = addHourlyValue(
+    contribution[hourlyField],
+    hour,
+    delta
+  );
+}
+
+function buildTimedAgentOpsContribution(args: {
+  workspaceId: Id<"workspaces">;
+  timestamp: number;
+  apply: (contribution: WorkspaceAgentOpsDailyContribution) => void;
+}): TargetedWorkspaceAgentOpsContribution {
+  const contribution = createEmptyAgentOpsContribution();
+  args.apply(contribution);
+  return {
+    workspaceId: args.workspaceId,
+    dayStartUtcMs: getUtcDayStartTimestamp(args.timestamp),
+    contribution,
+  };
+}
+
+function getQueryReviewTimestamp(
+  candidate: Pick<Doc<"queryCandidates">, "status" | "reviewedAt" | "updatedAt">
+) {
+  if (typeof candidate.reviewedAt === "number") {
+    return candidate.reviewedAt;
+  }
+
+  if (candidate.status === "generated") {
+    return undefined;
+  }
+
+  return candidate.updatedAt;
+}
+
+function getSuggestionDecisionTimestamp(
+  suggestion: Pick<Doc<"memorySuggestions">, "reviewedAt" | "updatedAt">
+) {
+  return suggestion.reviewedAt ?? suggestion.updatedAt;
+}
+
+function getRunStartedTimestamp(
+  run: Pick<Doc<"memoryEvaluatorRuns">, "startedAt" | "_creationTime">
+) {
+  return run.startedAt ?? run._creationTime;
+}
+
+function getRunFinishedTimestamp(
+  run: Pick<
+    Doc<"memoryEvaluatorRuns">,
+    "completedAt" | "updatedAt" | "startedAt" | "_creationTime"
+  >
+) {
+  return run.completedAt ?? run.updatedAt ?? run.startedAt ?? run._creationTime;
+}
+
+export function getWorkspaceAgentOpsContributionsFromKeyword(
+  keyword: Pick<Doc<"keywords">, "_creationTime" | "workspaceId">
+) {
+  return [
+    buildTimedAgentOpsContribution({
+      workspaceId: keyword.workspaceId,
+      timestamp: keyword._creationTime,
+      apply: (contribution) => {
+        applyTimedAgentOpsValue(
+          contribution,
+          keyword._creationTime,
+          "keywordsCreatedCount",
+          "hourlyKeywordsCreatedCounts",
+          1
+        );
+      },
+    }),
+  ];
+}
+
+export function getWorkspaceAgentOpsContributionsFromQueryCandidate(
+  candidate: Pick<
+    Doc<"queryCandidates">,
+    "_creationTime" | "workspaceId" | "status" | "reviewedAt" | "updatedAt"
+  >
+) {
+  const contributions: TargetedWorkspaceAgentOpsContribution[] = [
+    buildTimedAgentOpsContribution({
+      workspaceId: candidate.workspaceId,
+      timestamp: candidate._creationTime,
+      apply: (contribution) => {
+        applyTimedAgentOpsValue(
+          contribution,
+          candidate._creationTime,
+          "queriesGeneratedCount",
+          "hourlyQueriesGeneratedCounts",
+          1
+        );
+      },
+    }),
+  ];
+
+  const reviewedAt = getQueryReviewTimestamp(candidate);
+  if (typeof reviewedAt !== "number") {
+    return contributions;
+  }
+
+  contributions.push(
+    buildTimedAgentOpsContribution({
+      workspaceId: candidate.workspaceId,
+      timestamp: reviewedAt,
+      apply: (contribution) => {
+        applyTimedAgentOpsValue(
+          contribution,
+          reviewedAt,
+          "queriesReviewedCount",
+          "hourlyQueriesReviewedCounts",
+          1
+        );
+
+        if (candidate.status === "activated") {
+          applyTimedAgentOpsValue(
+            contribution,
+            reviewedAt,
+            "queriesActivatedCount",
+            "hourlyQueriesActivatedCounts",
+            1
+          );
+        }
+
+        if (candidate.status === "rejected_exact_duplicate") {
+          applyTimedAgentOpsValue(
+            contribution,
+            reviewedAt,
+            "queriesRejectedExactDuplicateCount",
+            "hourlyQueriesRejectedExactDuplicateCounts",
+            1
+          );
+        }
+
+        if (candidate.status === "rejected_semantic_duplicate") {
+          applyTimedAgentOpsValue(
+            contribution,
+            reviewedAt,
+            "queriesRejectedSemanticDuplicateCount",
+            "hourlyQueriesRejectedSemanticDuplicateCounts",
+            1
+          );
+        }
+      },
+    })
+  );
+
+  return contributions;
+}
+
+export function getWorkspaceAgentOpsContributionsFromMemorySuggestion(
+  suggestion: Pick<
+    Doc<"memorySuggestions">,
+    "_creationTime" | "workspaceId" | "status" | "reviewedAt" | "updatedAt"
+  >
+) {
+  const contributions: TargetedWorkspaceAgentOpsContribution[] = [
+    buildTimedAgentOpsContribution({
+      workspaceId: suggestion.workspaceId,
+      timestamp: suggestion._creationTime,
+      apply: (contribution) => {
+        applyTimedAgentOpsValue(
+          contribution,
+          suggestion._creationTime,
+          "suggestionsCreatedCount",
+          "hourlySuggestionsCreatedCounts",
+          1
+        );
+        if (suggestion.status === "pending_review") {
+          applyTimedAgentOpsValue(
+            contribution,
+            suggestion._creationTime,
+            "suggestionsPendingReviewCount",
+            "hourlySuggestionsPendingReviewCounts",
+            1
+          );
+        }
+      },
+    }),
+  ];
+
+  const reviewedAt = getSuggestionDecisionTimestamp(suggestion);
+  if (typeof reviewedAt !== "number") {
+    return contributions;
+  }
+
+  if (suggestion.status === "promoted") {
+    contributions.push(
+      buildTimedAgentOpsContribution({
+        workspaceId: suggestion.workspaceId,
+        timestamp: reviewedAt,
+        apply: (contribution) => {
+          applyTimedAgentOpsValue(
+            contribution,
+            reviewedAt,
+            "suggestionsPromotedCount",
+            "hourlySuggestionsPromotedCounts",
+            1
+          );
+        },
+      })
+    );
+  }
+
+  if (suggestion.status === "rejected") {
+    contributions.push(
+      buildTimedAgentOpsContribution({
+        workspaceId: suggestion.workspaceId,
+        timestamp: reviewedAt,
+        apply: (contribution) => {
+          applyTimedAgentOpsValue(
+            contribution,
+            reviewedAt,
+            "suggestionsRejectedCount",
+            "hourlySuggestionsRejectedCounts",
+            1
+          );
+        },
+      })
+    );
+  }
+
+  return contributions;
+}
+
+function getEventBooleanPayload(
+  event: Pick<Doc<"memoryWorkflowEvents">, "payload">,
+  key: string
+) {
+  const payload = isRecord(event.payload) ? event.payload : undefined;
+  const value = payload?.[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
+export function getWorkspaceAgentOpsContributionsFromWorkflowEvent(
+  event: Pick<
+    Doc<"memoryWorkflowEvents">,
+    "workspaceId" | "occurredAt" | "status" | "eventType" | "payload"
+  >
+) {
+  return [
+    buildTimedAgentOpsContribution({
+      workspaceId: event.workspaceId,
+      timestamp: event.occurredAt,
+      apply: (contribution) => {
+        applyTimedAgentOpsValue(
+          contribution,
+          event.occurredAt,
+          "eventsReceivedCount",
+          "hourlyEventsReceivedCounts",
+          1
+        );
+
+        if (event.status === "failed") {
+          applyTimedAgentOpsValue(
+            contribution,
+            event.occurredAt,
+            "failedEventsCount",
+            "hourlyFailedEventsCounts",
+            1
+          );
+        }
+
+        if (event.eventType === "qualification_completed") {
+          applyTimedAgentOpsValue(
+            contribution,
+            event.occurredAt,
+            "qualificationCompletedCount",
+            "hourlyQualificationCompletedCounts",
+            1
+          );
+          if (getEventBooleanPayload(event, "qualified") === true) {
+            applyTimedAgentOpsValue(
+              contribution,
+              event.occurredAt,
+              "qualificationQualifiedCount",
+              "hourlyQualificationQualifiedCounts",
+              1
+            );
+          }
+        }
+
+        if (event.eventType === "enrichment_completed") {
+          applyTimedAgentOpsValue(
+            contribution,
+            event.occurredAt,
+            "enrichmentCompletedCount",
+            "hourlyEnrichmentCompletedCounts",
+            1
+          );
+          const painPointCount = getNumberProperty(
+            isRecord(event.payload) ? event.payload : undefined,
+            "painPointCount"
+          );
+          if (typeof painPointCount === "number" && painPointCount > 0) {
+            applyTimedAgentOpsValue(
+              contribution,
+              event.occurredAt,
+              "enrichmentPainPointCountSum",
+              "hourlyEnrichmentPainPointCountSums",
+              painPointCount
+            );
+          }
+        }
+
+        if (event.eventType === "outreach_task_approved") {
+          applyTimedAgentOpsValue(
+            contribution,
+            event.occurredAt,
+            "outreachTaskApprovedCount",
+            "hourlyOutreachTaskApprovedCounts",
+            1
+          );
+          if (getEventBooleanPayload(event, "edited") === true) {
+            applyTimedAgentOpsValue(
+              contribution,
+              event.occurredAt,
+              "outreachTaskApprovedEditedCount",
+              "hourlyOutreachTaskApprovedEditedCounts",
+              1
+            );
+          }
+        }
+      },
+    }),
+  ];
+}
+
+export function getWorkspaceAgentOpsContributionsFromEvaluatorRun(
+  run: Pick<
+    Doc<"memoryEvaluatorRuns">,
+    | "_creationTime"
+    | "workspaceId"
+    | "status"
+    | "startedAt"
+    | "completedAt"
+    | "updatedAt"
+  >
+) {
+  const startedAt = getRunStartedTimestamp(run);
+  const contributions: TargetedWorkspaceAgentOpsContribution[] = [
+    buildTimedAgentOpsContribution({
+      workspaceId: run.workspaceId,
+      timestamp: startedAt,
+      apply: (contribution) => {
+        applyTimedAgentOpsValue(
+          contribution,
+          startedAt,
+          "runsStartedCount",
+          "hourlyRunsStartedCounts",
+          1
+        );
+      },
+    }),
+  ];
+
+  if (run.status === "failed") {
+    const failedAt = getRunFinishedTimestamp(run);
+    contributions.push(
+      buildTimedAgentOpsContribution({
+        workspaceId: run.workspaceId,
+        timestamp: failedAt,
+        apply: (contribution) => {
+          applyTimedAgentOpsValue(
+            contribution,
+            failedAt,
+            "failedRunsCount",
+            "hourlyFailedRunsCounts",
+            1
+          );
+        },
+      })
+    );
+  }
+
+  return contributions;
+}
+
+function getWorkspaceAgentOpsContributionsFromMemoryMetrics(args: {
+  workspaceId: Id<"workspaces">;
+  createdAt: number;
+  impactScore: number;
+  confidence: number;
+}) {
+  return [
+    buildTimedAgentOpsContribution({
+      workspaceId: args.workspaceId,
+      timestamp: args.createdAt,
+      apply: (contribution) => {
+        applyTimedAgentOpsValue(
+          contribution,
+          args.createdAt,
+          "memoriesWrittenCount",
+          "hourlyMemoriesWrittenCounts",
+          1
+        );
+        if (args.impactScore >= HIGH_IMPACT_MEMORY_THRESHOLD) {
+          applyTimedAgentOpsValue(
+            contribution,
+            args.createdAt,
+            "highImpactMemoriesCount",
+            "hourlyHighImpactMemoriesCounts",
+            1
+          );
+        }
+        applyTimedAgentOpsValue(
+          contribution,
+          args.createdAt,
+          "memoryImpactScoreSum",
+          "hourlyMemoryImpactScoreSums",
+          Math.max(0, args.impactScore * 100)
+        );
+        applyTimedAgentOpsValue(
+          contribution,
+          args.createdAt,
+          "memoryConfidenceSum",
+          "hourlyMemoryConfidenceSums",
+          Math.max(0, args.confidence * 100)
+        );
+      },
+    }),
+  ];
+}
+
+export function getWorkspaceAgentOpsContributionsFromBuiltInMemory(args: {
+  workspaceId: Id<"workspaces">;
+  memory: Pick<WorkspaceAgentMemoryRecord, "createdAt" | "parsed">;
+}) {
+  return getWorkspaceAgentOpsContributionsFromMemoryMetrics({
+    workspaceId: args.workspaceId,
+    createdAt: args.memory.createdAt,
+    impactScore: args.memory.parsed.impactScore,
+    confidence: args.memory.parsed.confidence,
+  });
+}
+
+export function getWorkspaceAgentOpsContributionsFromMemoryInventory(
+  memory: Pick<
+    Doc<"workspaceAgentMemoryInventory">,
+    "workspaceId" | "createdAt" | "impactScore" | "confidence"
+  >
+) {
+  return getWorkspaceAgentOpsContributionsFromMemoryMetrics({
+    workspaceId: memory.workspaceId,
+    createdAt: memory.createdAt,
+    impactScore: memory.impactScore,
+    confidence: memory.confidence,
+  });
+}
+
+export function mergeWorkspaceAgentOpsContributions(
+  existing: WorkspaceAgentOpsDailyRecord | Doc<"workspaceAgentOpsDaily"> | null,
+  args: {
+    workspaceId: Id<"workspaces">;
+    dayStartUtcMs: number;
+    remove?: WorkspaceAgentOpsDailyContribution[];
+    add?: WorkspaceAgentOpsDailyContribution[];
+  }
+): WorkspaceAgentOpsDailyRecord {
+  const now = getCurrentUTCTimestamp();
+  const next = existing
+    ? normalizeWorkspaceAgentOpsDailyRecord(existing)
+    : createEmptyWorkspaceAgentOpsDailyRecord({
+        workspaceId: args.workspaceId,
+        dayStartUtcMs: args.dayStartUtcMs,
+      });
+
+  const mergeContribution = (
+    contribution: WorkspaceAgentOpsDailyContribution,
+    direction: 1 | -1
+  ) => {
+    for (const field of AGENT_OPS_NUMERIC_FIELDS) {
+      next[field] = Math.max(0, next[field] + contribution[field] * direction);
+    }
+    for (const field of AGENT_OPS_HOURLY_FIELDS) {
+      next[field] = next[field].map((value, index) =>
+        Math.max(0, value + contribution[field][index] * direction)
+      );
+    }
+  };
+
+  for (const contribution of args.remove ?? []) {
+    mergeContribution(contribution, -1);
+  }
+  for (const contribution of args.add ?? []) {
+    mergeContribution(contribution, 1);
+  }
+
+  next.workspaceId = args.workspaceId;
+  next.dayStartUtcMs = args.dayStartUtcMs;
+  next.dayKey = getUtcDayKeyFromStart(args.dayStartUtcMs);
+  next.updatedAt = now;
+
+  return next;
+}
+
+export function mergeWorkspaceAgentOpsStripeContributions(
+  existing: WorkspaceAgentOpsDailyRecord | null,
+  args: {
+    workspaceId: Id<"workspaces">;
+    dayStartUtcMs: number;
+    remove?: WorkspaceAgentOpsDailyContribution[];
+    add?: WorkspaceAgentOpsDailyContribution[];
+  }
+): WorkspaceAgentOpsDailyRecord {
+  const next = existing
+    ? normalizeSignedWorkspaceAgentOpsDailyRecord(existing)
+    : createEmptyWorkspaceAgentOpsDailyRecord({
+        workspaceId: args.workspaceId,
+        dayStartUtcMs: args.dayStartUtcMs,
+      });
+
+  const apply = (
+    contribution: WorkspaceAgentOpsDailyContribution,
+    direction: 1 | -1
+  ) => {
+    for (const field of AGENT_OPS_NUMERIC_FIELDS) {
+      next[field] += contribution[field] * direction;
+    }
+    for (const field of AGENT_OPS_HOURLY_FIELDS) {
+      next[field] = next[field].map(
+        (value, index) => value + contribution[field][index] * direction
+      );
+    }
+  };
+
+  for (const contribution of args.remove ?? []) apply(contribution, -1);
+  for (const contribution of args.add ?? []) apply(contribution, 1);
+
+  next.workspaceId = args.workspaceId;
+  next.dayStartUtcMs = args.dayStartUtcMs;
+  next.dayKey = getUtcDayKeyFromStart(args.dayStartUtcMs);
+  next.updatedAt = getCurrentUTCTimestamp();
+  return next;
+}
+
+export function combineWorkspaceAgentOpsRecords(args: {
+  workspaceId: Id<"workspaces">;
+  dayStartUtcMs: number;
+  baseline: WorkspaceAgentOpsDailyRecord | null;
+  stripes: WorkspaceAgentOpsDailyRecord[];
+}): WorkspaceAgentOpsDailyRecord {
+  const next = createEmptyWorkspaceAgentOpsDailyRecord({
+    workspaceId: args.workspaceId,
+    dayStartUtcMs: args.dayStartUtcMs,
+  });
+
+  const records = [
+    args.baseline ? normalizeWorkspaceAgentOpsDailyRecord(args.baseline) : null,
+    ...args.stripes.map(normalizeSignedWorkspaceAgentOpsDailyRecord),
+  ];
+  for (const normalized of records) {
+    if (!normalized) continue;
+    for (const field of AGENT_OPS_NUMERIC_FIELDS) {
+      next[field] += normalized[field];
+    }
+    for (const field of AGENT_OPS_HOURLY_FIELDS) {
+      next[field] = next[field].map(
+        (value, index) => value + normalized[field][index]
+      );
+    }
+  }
+
+  for (const field of AGENT_OPS_NUMERIC_FIELDS) {
+    next[field] = Math.max(0, next[field]);
+  }
+  for (const field of AGENT_OPS_HOURLY_FIELDS) {
+    next[field] = next[field].map((value) => Math.max(0, value));
+  }
+  next.updatedAt = Math.max(
+    0,
+    args.baseline?.updatedAt ?? 0,
+    ...args.stripes.map((stripe) => stripe.updatedAt)
+  );
+  return next;
+}
+
+export function isWorkspaceAgentOpsStripeEmpty(
+  row: WorkspaceAgentOpsDailyRecord
+) {
+  const normalized = normalizeSignedWorkspaceAgentOpsDailyRecord(row);
+  return (
+    AGENT_OPS_NUMERIC_FIELDS.every((field) => normalized[field] === 0) &&
+    AGENT_OPS_HOURLY_FIELDS.every((field) =>
+      normalized[field].every((value) => value === 0)
+    )
+  );
+}
+
+export function isWorkspaceAgentOpsDailyRecordEmpty(
+  row: WorkspaceAgentOpsDailyRecord
+) {
+  const normalized = normalizeWorkspaceAgentOpsDailyRecord(row);
+  return AGENT_OPS_NUMERIC_FIELDS.every((field) => normalized[field] === 0);
+}
+
+export function mergeWorkspaceQueryPerformanceDailyDelta(
+  existing:
+    | WorkspaceQueryPerformanceDailyRecord
+    | Doc<"workspaceQueryPerformanceDaily">
+    | null,
+  args: WorkspaceQueryPerformanceDailyDelta
+): WorkspaceQueryPerformanceDailyRecord {
+  const dayStartUtcMs = getUtcDayStartTimestamp(args.timestamp);
+  const hour = getUtcHourIndex(args.timestamp);
+  const next = existing
+    ? ({
+        ...existing,
+      } as WorkspaceQueryPerformanceDailyRecord)
+    : createEmptyWorkspaceQueryPerformanceDailyRecord({
+        workspaceId: args.workspaceId,
+        queryId: args.queryId,
+        activatedQueryCandidateId: args.activatedQueryCandidateId,
+        dayStartUtcMs,
+      });
+
+  next.workspaceId = args.workspaceId;
+  next.queryId = args.queryId;
+  next.activatedQueryCandidateId =
+    args.activatedQueryCandidateId ?? next.activatedQueryCandidateId;
+  next.dayStartUtcMs = dayStartUtcMs;
+  next.dayKey = getUtcDayKeyFromStart(dayStartUtcMs);
+  next.updatedAt = getCurrentUTCTimestamp();
+
+  const deltas: Array<
+    [
+      QueryPerformanceNumericField,
+      QueryPerformanceHourlyField,
+      number | undefined,
+    ]
+  > = [
+    ["impressionsCount", "hourlyImpressionsCounts", args.impressionsDelta],
+    [
+      "prospectsFoundCount",
+      "hourlyProspectsFoundCounts",
+      args.prospectsFoundDelta,
+    ],
+    ["qualifiedCount", "hourlyQualifiedCounts", args.qualifiedCountDelta],
+    ["convertedCount", "hourlyConvertedCounts", args.convertedCountDelta],
+    ["replyCount", "hourlyReplyCounts", args.replyCountDelta],
+  ];
+
+  for (const [numericField, hourlyField, delta] of deltas) {
+    if (typeof delta !== "number" || delta === 0) {
+      continue;
+    }
+    next[numericField] = Math.max(0, next[numericField] + delta);
+    next[hourlyField] = addHourlyValue(next[hourlyField], hour, delta);
+  }
+
+  return next;
+}
+
+export function isWorkspaceQueryPerformanceDailyRecordEmpty(
+  row: WorkspaceQueryPerformanceDailyRecord
+) {
+  return QUERY_PERFORMANCE_NUMERIC_FIELDS.every((field) => row[field] === 0);
+}
+
+export function getWorkspaceQueryPerformanceDailyDeltasFromWorkflowEvent(args: {
+  workspaceId: Id<"workspaces">;
+  event: Pick<
+    Doc<"memoryWorkflowEvents">,
+    "eventType" | "occurredAt" | "prospectId" | "payload"
+  >;
+  prospect: Pick<
+    Doc<"prospects">,
+    "matchedKeywords" | "qualificationStatus"
+  > | null;
+  keywordIdByCanonicalHash: ReadonlyMap<string, Id<"keywords">>;
+  candidateIdByKeywordId: ReadonlyMap<
+    Id<"keywords">,
+    Id<"queryCandidates"> | undefined
+  >;
+}) {
+  if (!args.prospect) {
+    return [];
+  }
+
+  let deltaField:
+    | "qualifiedCountDelta"
+    | "replyCountDelta"
+    | "convertedCountDelta"
+    | null = null;
+  let deltaValue = 0;
+
+  if (args.event.eventType === "qualification_completed") {
+    const eventQualified = getEventBooleanPayload(args.event, "qualified");
+    const currentlyQualified =
+      args.prospect.qualificationStatus === "qualified";
+    const qualified =
+      eventQualified === undefined
+        ? currentlyQualified
+        : eventQualified && currentlyQualified;
+    deltaField = "qualifiedCountDelta";
+    deltaValue = qualified ? 1 : 0;
+  } else if (args.event.eventType === "prospect_responded") {
+    deltaField = "replyCountDelta";
+    deltaValue = 1;
+  } else if (args.event.eventType === "prospect_converted") {
+    deltaField = "convertedCountDelta";
+    deltaValue = 1;
+  }
+
+  if (!deltaField || deltaValue <= 0) {
+    return [];
+  }
+
+  const deltas: WorkspaceQueryPerformanceDailyDelta[] = [];
+  const seen = new Set<string>();
+
+  for (const matchedKeyword of args.prospect.matchedKeywords ?? []) {
+    const canonical = buildQueryCandidateCanonicalRecord({
+      type: "social_query",
+      value: matchedKeyword,
+    });
+    const queryId = args.keywordIdByCanonicalHash.get(canonical.canonicalHash);
+    if (!queryId) {
+      continue;
+    }
+    const dedupeKey = String(queryId);
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+    deltas.push({
+      workspaceId: args.workspaceId,
+      queryId,
+      activatedQueryCandidateId: args.candidateIdByKeywordId.get(queryId),
+      timestamp: args.event.occurredAt,
+      [deltaField]: deltaValue,
+    });
+  }
+
+  return deltas;
+}

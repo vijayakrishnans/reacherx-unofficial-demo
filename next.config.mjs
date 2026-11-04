@@ -1,0 +1,117 @@
+// next.config.mjs
+import createMDX from "@next/mdx";
+import { fileURLToPath } from "node:url";
+
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // Next.js 16: Enable Cache Components (PPR + "use cache" directive)
+  cacheComponents: true,
+
+  // Keep Flight headers visible to proxy.ts so Markdown negotiation cannot
+  // rewrite a React navigation/prefetch response into plain text.
+  skipProxyUrlNormalize: true,
+
+  // The Open Graph image routes read this package asset at runtime. Explicitly
+  // trace it so Vercel's isolated function includes the font, not only local
+  // installs.
+  outputFileTracingIncludes: {
+    "/blog/opengraph-image": [
+      "./node_modules/geist/dist/fonts/geist-sans/Geist-Regular.ttf",
+    ],
+    "/blog/*/opengraph-image": [
+      "./node_modules/geist/dist/fonts/geist-sans/Geist-Regular.ttf",
+    ],
+    "/home/opengraph-image": [
+      "./node_modules/geist/dist/fonts/geist-sans/Geist-Regular.ttf",
+    ],
+  },
+
+  async redirects() {
+    return [
+      {
+        source: "/home/use-cases",
+        destination: "/home",
+        permanent: true,
+      },
+      {
+        source: "/home/pricing",
+        destination: "/pricing",
+        permanent: true,
+      },
+      {
+        source:
+          "/:slug(prospects|candidates|partners|investors|participants|creators|potential-members|guests|people)",
+        destination: "/",
+        permanent: false,
+      },
+    ];
+  },
+
+  compiler: {
+    removeConsole: true,
+  },
+  images: {
+    formats: ["image/webp", "image/avif"],
+    remotePatterns: [
+      {
+        // X/Twitter profile images and tweet media
+        protocol: "https",
+        hostname: "pbs.twimg.com",
+      },
+      {
+        // X/Twitter direct-message media
+        protocol: "https",
+        hostname: "ton.twitter.com",
+      },
+      {
+        // UploadThing storage (user uploads, video posters)
+        protocol: "https",
+        hostname: "*.ufs.sh",
+      },
+      {
+        // LinkedIn profile images, post media, and messaging attachments
+        protocol: "https",
+        hostname: "*.licdn.com",
+      },
+      {
+        // Mux-generated video posters
+        protocol: "https",
+        hostname: "image.mux.com",
+      },
+      {
+        // Convex storage (workspace attachment previews)
+        protocol: "https",
+        hostname: "*.convex.cloud",
+      },
+    ],
+  },
+
+  experimental: {
+    // Turbopack: Persist compiler artifacts for faster dev restarts
+    turbopackFileSystemCacheForDev: true,
+  },
+
+  // Misc project settings (keep or remove as you like)
+  compress: true,
+  trailingSlash: false,
+};
+
+const withMDX = createMDX({
+  options: {
+    remarkPlugins: [
+      "remark-frontmatter",
+      "remark-gfm",
+      fileURLToPath(
+        new URL("./features/blog/lib/remarkBlogCode.mjs", import.meta.url)
+      ),
+    ],
+    rehypePlugins: [
+      "rehype-slug",
+      fileURLToPath(
+        new URL("./features/blog/lib/rehypeBlogTaskLists.mjs", import.meta.url)
+      ),
+    ],
+  },
+});
+
+export default withMDX(nextConfig);

@@ -1,0 +1,76 @@
+"use node";
+
+import { createTool } from "@convex-dev/agent";
+import { z } from "zod";
+import { internal } from "../../../_generated/api";
+import {
+  AMBIGUOUS_PROSPECT_SELECTION_MESSAGE,
+  resolveExecutionThreadId,
+} from "./helpers";
+
+export interface ApproveSocialActionRequestResult {
+  success: boolean;
+  message: string;
+  actionRequestId?: string;
+  error?: string;
+}
+
+export const approveSocialActionRequest = createTool({
+  description:
+    "Approve the pending social action request for the current thread. Use this when the user explicitly confirms a staged X or LinkedIn action.",
+  inputSchema: z.object({}),
+  execute: async (ctx): Promise<ApproveSocialActionRequestResult> => {
+    const executionThreadId = await resolveExecutionThreadId(
+      ctx,
+      "approveSocialActionRequest"
+    );
+
+    if (!ctx.threadId) {
+      return {
+        success: false,
+        message: "No thread context available for approval.",
+        error: "Missing thread context",
+      };
+    }
+    if (!executionThreadId) {
+      return {
+        success: false,
+        message: AMBIGUOUS_PROSPECT_SELECTION_MESSAGE,
+        error: "Ambiguous profile context",
+      };
+    }
+
+    const pendingRequest = await ctx.runQuery(
+      internal.socialActions.getPendingActionRequestForThread,
+      {
+        threadId: executionThreadId,
+      }
+    );
+
+    if (!pendingRequest) {
+      return {
+        success: false,
+        message: "No pending social action request was found for this thread.",
+        error: "No pending request",
+      };
+    }
+
+    await ctx.runMutation(internal.socialActions.approveActionRequestInternal, {
+      actionRequestId: pendingRequest._id,
+    });
+
+    await ctx.scheduler.runAfter(
+      0,
+      internal.socialActionExecutors.executeActionRequestInternal,
+      {
+        actionRequestId: pendingRequest._id,
+      }
+    );
+
+    return {
+      success: true,
+      actionRequestId: pendingRequest._id,
+      message: "Approval accepted. The action is now executing.",
+    };
+  },
+});

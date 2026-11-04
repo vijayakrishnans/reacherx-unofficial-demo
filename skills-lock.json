@@ -1,0 +1,214 @@
+{
+  "version": 1,
+  "skills": {
+    "ai-sdk": {
+      "source": "vercel/ai",
+      "sourceType": "github",
+      "computedHash": "27827bb6ca05cb6757953e507f46dc1c2bf44e48c1928eb3e49f2b675a168492"
+    },
+    "composio": {
+      "source": "composiohq/skills",
+      "sourceType": "github",
+      "computedHash": "11b975f122ecbf455b437e4e42ebf8f30fad84220894c3d52549eefea92a7795"
+    },
+    "convex": {
+      "source": "get-convex/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/convex/SKILL.md",
+      "computedHash": "c5f3622c64ef550aac27d1dbc041f0c7c40d9119863c9fb8bac180b0498ee8ed"
+    },
+    "convex-agents": {
+      "source": "waynesutton/convexskills",
+      "sourceType": "github",
+      "computedHash": "3054123dedc1b7ded9b6404c6c641023683fe509103fe7dc148acda831d53d36"
+    },
+    "convex-best-practices": {
+      "source": "waynesutton/convexskills",
+      "sourceType": "github",
+      "computedHash": "3b24d2afbb5859e3a3640c1e47e2ac9ace81e9737ec76b891951999361c92ab1"
+    },
+    "convex-create-component": {
+      "source": "get-convex/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/convex-create-component/SKILL.md",
+      "computedHash": "012acb639fccc22a47e89ef69941689f9328ac9ff5b872d77af6328407ec8876"
+    },
+    "convex-cron-jobs": {
+      "source": "waynesutton/convexskills",
+      "sourceType": "github",
+      "computedHash": "e786347f192c02a97e703b41cb2d8727346092b7112a1c86da9fbe982247962e"
+    },
+    "convex-file-storage": {
+      "source": "waynesutton/convexskills",
+      "sourceType": "github",
+      "computedHash": "a541556841d1a907059f73ef4a428a4655b3355baf160e5c0aca1cac86054c0b"
+    },
+    "convex-http-actions": {
+      "source": "waynesutton/convexskills",
+      "sourceType": "github",
+      "computedHash": "c189703dd5d91f280b53d6bd903bf8313e935b1edab136bb7ffdb6c1512b95aa"
+    },
+    "convex-migration-helper": {
+      "source": "get-convex/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/convex-migration-helper/SKILL.md",
+      "computedHash": "1ed5ef230d484e9884d881ddbd15158f0070382f8c6097364cb8ed2ec458decd"
+    },
+    "convex-performance-audit": {
+      "source": "get-convex/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/convex-performance-audit/SKILL.md",
+      "computedHash": "2eaf22b20f74ab39f336b41845b834b8796b6d2b380bc078a1ab54769c3f233c"
+    },
+    "convex-quickstart": {
+      "source": "get-convex/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/convex-quickstart/SKILL.md",
+      "computedHash": "54e5271d5d613cc4c0068baa250613b5abb6e4533df1e67adc26d2e0c7d68ded"
+    },
+    "convex-realtime": {
+      "source": "waynesutton/convexskills",
+      "sourceType": "github",
+      "computedHash": "aa08a2856778c09aa8c0f5eef431fc102115e04461d7d3f86e6ce97b5848b52f"
+    },
+    "convex-schema-validator": {
+      "source": "waynesutton/convexskills",
+      "sourceType": "github",
+      "computedHash": "97b7965f2bc665f1848196813c79e32bff2d8b58b3a701b313c4a96f0bf5ac95"
+    },
+    "convex-security-check": {
+      "source": "waynesutton/convexskills",
+      "sourceType": "github",
+      "computedHash": "b53e061304bb81d037c6dd4e38762d27a596523bcbeab43c58e0b05140449802"
+    },
+    "convex-setup-auth": {
+      "source": "get-convex/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/convex-setup-auth/SKILL.md",
+      "computedHash": "b1a940758751c5b2fdc6ced105b19927a1655f0c1d4bd2fd5536dc3264202c00"
+    },
+    "core": {
+      "source": "vercel-labs/json-render",
+      "sourceType": "github",
+      "computedHash": "ee0feec2d99e508c9561455afa6697c8ce3f6ab03b5428fe671b881abb0a022f"
+    },
+    "create-agent": {
+      "source": "openrouterteam/agent-skills",
+      "sourceType": "github",
+      "computedHash": "7232cfa7d012008bf12fa33815af49db10e7ddd5549c75c501168875a5334e11"
+    },
+    "debug-browser-session": {
+      "source": "kernel/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/kernel-cli/skills/debug-browser-session/SKILL.md",
+      "computedHash": "f3c0e86f2de9af65c20b67de2d8cda550d496d181462b7e31bda362ec449c590"
+    },
+    "diff-profile-archives": {
+      "source": "kernel/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/kernel-cli/skills/diff-profile-archives/SKILL.md",
+      "computedHash": "82a23fb8a98739a0d92c770753edefb5b16706cd81f6bc04bf8046d02b1f119a"
+    },
+    "find-skills": {
+      "source": "vercel-labs/skills",
+      "sourceType": "github",
+      "computedHash": "9e1c8b3103f92fa8092568a44fe64858de7c5c9dc65ce4bea8f168080e889cfd"
+    },
+    "frontend-design": {
+      "source": "anthropics/skills",
+      "sourceType": "github",
+      "computedHash": "063a0e6448123cd359ad0044cc46b0e490cc7964d45ef4bb9fd842bd2ffbca67"
+    },
+    "generate-video": {
+      "source": "kernel/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/generate-video/skills/generate-video/SKILL.md",
+      "computedHash": "a48a77356c63cba5783745c27600ef16aaff26c39a93aa50c777a3dd9d4dfc30"
+    },
+    "kernel-agent-browser": {
+      "source": "kernel/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/kernel-cli/skills/kernel-agent-browser/SKILL.md",
+      "computedHash": "e7fa13b3331541b1e778fe85f551c92d108d48f5ce70688e0a40111fe7191598"
+    },
+    "kernel-auth": {
+      "source": "kernel/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/kernel-cli/skills/kernel-auth/SKILL.md",
+      "computedHash": "985abde612c4904f8745ca2a70e4ad478f6db402c5880ce8ba4ddf918059aa9c"
+    },
+    "kernel-browser-harness": {
+      "source": "kernel/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/kernel-cli/skills/kernel-browser-harness/SKILL.md",
+      "computedHash": "59de963759b6e38b5f2e4d9f1bb26b447c902ddcb580c70d527b28bb81fc178c"
+    },
+    "kernel-cli": {
+      "source": "kernel/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/kernel-cli/skills/kernel-cli/SKILL.md",
+      "computedHash": "4ad2991491dfc8c6cb8039be19b30cda802c3f4025b18fb5e7b2e4b8b5537dfd"
+    },
+    "kernel-python-sdk": {
+      "source": "kernel/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/kernel-sdks/skills/kernel-python-sdk/SKILL.md",
+      "computedHash": "c72895de830efd1d6732c6a069f9b4da7073985736c224a17ee7caf6f5e41980"
+    },
+    "kernel-typescript-sdk": {
+      "source": "kernel/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/kernel-sdks/skills/kernel-typescript-sdk/SKILL.md",
+      "computedHash": "7e3d3ca82e68b93059a61f87846ee08278f96689e3b99b600d4f92faf3d91ec8"
+    },
+    "logging-best-practices": {
+      "source": "boristane/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/logging-best-practices/SKILL.md",
+      "computedHash": "b4810947c33b5356bf385c84cfe387afa9c54af652baaedb7d642a083cceaa4c"
+    },
+    "mux-video": {
+      "source": "muxinc/skills",
+      "sourceType": "github",
+      "skillPath": "skills/mux/SKILL.md",
+      "computedHash": "eaf3453ee47a8e00c657a6e9562389a88c03604761a6ed10a44224b4e7128f8a"
+    },
+    "openrouter-typescript-sdk": {
+      "source": "openrouterteam/agent-skills",
+      "sourceType": "github",
+      "computedHash": "0cb0e2f07f6b42fb8974c2ee89ca3ba3a103dfe565f12bc7ca9f41945fc7227a"
+    },
+    "profile-website-bot-detection": {
+      "source": "kernel/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/kernel-cli/skills/profile-website-bot-detection/SKILL.md",
+      "computedHash": "8938c71df134feabb7746ed4e5c04811e6669994e85c51e725baeefd0a5070bf"
+    },
+    "react-doctor": {
+      "source": "millionco/react-doctor",
+      "sourceType": "github",
+      "computedHash": "b8f396bd6db7404a899af03e649f2cf12f4c846ee7d85b6b9a475cb8175abb49"
+    },
+    "vercel-composition-patterns": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "computedHash": "575757e3e25761c8c562d6e395d29f0b76c98b1273c0bd72d88e6ab1bc9c7d42"
+    },
+    "vercel-react-best-practices": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "computedHash": "ca7b0c0c6e5f2750043f7f0cd72d16ac4e2abc48f9b5500d047a4b77a2506212"
+    },
+    "vercel-react-view-transitions": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "computedHash": "c8952fc9127fa0564d0cb71dccb4215a5608ac933b5831104f09173a97a46f85"
+    },
+    "workos": {
+      "source": "workos/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/workos/skills/workos/SKILL.md",
+      "computedHash": "c63352baa81577b700a711de71d444398ecc295891a2fe2e9035b216dbaa187a"
+    }
+  }
+}

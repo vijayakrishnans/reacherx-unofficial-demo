@@ -1,0 +1,1009 @@
+"use client";
+
+import { WorkspaceUsageIndicator } from "@/features/billing/ui/components/WorkspaceUsageIndicator";
+
+import * as React from "react";
+import Link from "next/link";
+import { Slot } from "@radix-ui/react-slot";
+import { cva, type VariantProps } from "class-variance-authority";
+import { useMutation } from "convex/react";
+import { useTheme } from "next-themes";
+import { usePathname, useRouter } from "next/navigation";
+import { useAuth } from "@workos-inc/authkit-nextjs/components";
+
+import { cn } from "@/shared/lib/utils";
+import { logout } from "@/shared/lib/auth/logout";
+import { buildSetupHref } from "@/shared/lib/urls/setupHref";
+import { getWorkspaceSwitchHref } from "@/shared/lib/urls/workspaceSwitchHref";
+import { api } from "@/convex/_generated/api";
+import type { Id } from "@/convex/_generated/dataModel";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger,
+  DropdownMenuSubContent,
+  DropdownMenuPortal,
+} from "@/shared/ui/components/DropdownMenu";
+import { Button } from "@/shared/ui/components/Button";
+import { Badge } from "@/shared/ui/components/Badge";
+import {
+  AccountBoxIcon,
+  ActivityZoneIcon,
+  AddIcon,
+  ArchiveIcon,
+  BidLandscapeIcon,
+  ChangeCircleIcon,
+  ChangeHistoryIcon,
+  CheckIcon,
+  ContrastIcon,
+  CreditCardIcon,
+  DarkModeIcon,
+  DataUsageIcon,
+  FolderCopyIcon,
+  FolderIcon,
+  FramePersonIcon,
+  HomeIcon,
+  LightModeIcon,
+  LogoutIcon,
+  MailIcon,
+  ManageAccountsIcon,
+  LockIcon,
+  NotificationsIcon,
+  UpgradeIcon,
+} from "@/shared/ui/components/icons";
+import AnimatedNumber from "@/shared/ui/components/AnimatedNumber";
+import { SidebarTrigger } from "@/shared/ui/components/Sidebar";
+import {
+  ToggleGroup,
+  ToggleGroupItem,
+} from "@/shared/ui/components/ToggleGroup";
+import {
+  Avatar,
+  AvatarFallback,
+  AvatarImage,
+} from "@/shared/ui/components/Avatar";
+import { Skeleton } from "@/shared/ui/components/Skeleton";
+import { AsciiSpinnerText } from "@/shared/ui/components/AsciiSpinnerText";
+import { useAuth as useAppAuth } from "@/shared/hooks/useAuth";
+import {
+  useActiveUseCaseLabels,
+  usePreferredShellQueryArgs,
+  useQueryWithStatus,
+} from "@/shared/hooks";
+import { useWorkspaceTransition } from "@/features/webapp/contexts/WorkspaceTransitionContext";
+import { toast } from "sonner";
+import { useStore } from "@nanostores/react";
+import { $onboardingLock } from "@/shared/stores/onboarding";
+import {
+  setPreferredShellContext,
+  usePreferredShellContext,
+} from "@/shared/stores/preferredShellContext";
+import { logger } from "@/shared/lib/logger";
+
+const headerLogger = logger.withScope("Header");
+import { useNewWorkspaceDraftFlow } from "@/features/webapp/hooks/useNewWorkspaceDraftFlow";
+import { getPlansUpgradeHref } from "@/features/billing/lib/plansUpgradeUrl";
+import { WorkspaceSystemStatusTrigger } from "./WorkspaceSystemStatusTrigger";
+
+/* ----------------------------------------------------------------------------
+ * Header Variants (CVA)
+ * ----------------------------------------------------------------------------
+ */
+const headerVariants = cva(
+  "fixed top-0 left-0 right-0 z-20 flex items-center justify-between ease-[cubic-bezier(0.25,1,0.5,1)] duration-300 border-b border-border w-full h-12 bg-background",
+  {
+    variants: {
+      size: {
+        default: "pr-4 md:pr-2",
+      },
+    },
+    defaultVariants: {
+      size: "default",
+    },
+  }
+);
+
+const desktopNavMenuVariants = cva("items-center gap-2 flex");
+const brandLinkVariants = cva(
+  "text-[1.75rem] font-medium font-mono w-12 text-center leading-[normal!important]"
+);
+const navVariants = cva("flex items-center gap-0 md:gap-4");
+const versionBadgeFrameVariants = cva(
+  "border-border mr-2 inline-flex border-r border-l px-2 py-[0.969rem]"
+);
+
+/* ----------------------------------------------------------------------------
+ * Header Props
+ * ----------------------------------------------------------------------------
+ */
+export interface HeaderProps
+  extends
+    React.HTMLAttributes<HTMLElement>,
+    VariantProps<typeof headerVariants> {
+  asChild?: boolean;
+}
+
+type WorkspaceSwitcherItem = {
+  value: string;
+  label: string;
+  isActive?: boolean;
+  locked?: boolean;
+  kind?: "draft" | "workspace" | string;
+  workspaceId?: string;
+  sessionId?: string;
+  threadId?: string;
+};
+
+function getInitials(name?: string) {
+  if (!name) return "?";
+  return name
+    .split(" ")
+    .map((segment) => segment[0])
+    .join("")
+    .toUpperCase();
+}
+
+/* ----------------------------------------------------------------------------
+ * Header Component
+ * ----------------------------------------------------------------------------
+ */
+export function Header({
+  className,
+  size,
+  asChild = false,
+  ...props
+}: HeaderProps) {
+  const { user, loading } = useAuth();
+  const { workspace } = useAppAuth();
+  const { pageLabels, routes } = useActiveUseCaseLabels();
+  const router = useRouter();
+  const pathname = usePathname();
+  const { theme, setTheme } = useTheme();
+  const setDefaultWorkspace = useMutation(api.workspaces.setDefaultWorkspace);
+  const { startTransition, completeTransition, resetTransition } =
+    useWorkspaceTransition();
+  const locked = useStore($onboardingLock);
+  const preferredShellContext = usePreferredShellContext();
+  const preferredShellQueryArgs = usePreferredShellQueryArgs();
+  const { modal, requestNewWorkspace } = useNewWorkspaceDraftFlow({
+    enabled: Boolean(user) && !locked,
+  });
+
+  // Get current user plan
+  const planQuery = useQueryWithStatus(
+    api.plans.getCurrentPlan,
+    user ? {} : "skip"
+  );
+  const workspaceCreationEligibilityQuery = useQueryWithStatus(
+    api.plans.getWorkspaceCreationEligibility,
+    user ? {} : "skip"
+  );
+  // Get user workspaces
+  const shellStateQuery = useQueryWithStatus(
+    api.shell.getAppShellState,
+    user ? preferredShellQueryArgs : "skip"
+  );
+  const plan = planQuery.data;
+  const workspaceCreationEligibility = workspaceCreationEligibilityQuery.data;
+  const shellState = shellStateQuery.data;
+  const workspaceSystemStatus = shellState?.workspaceSystemStatus ?? null;
+  const pendingNotificationCount = shellState?.pendingNotificationCount ?? 0;
+
+  // Allow overriding the rendered element
+  const Comp = asChild ? Slot : "header";
+
+  // Derive tier and workspace info
+  const tier = plan?.tier ?? "free";
+  const isFree = tier === "free";
+  const isHighestTier = tier === "pro";
+  const hasLockedItems = shellState?.showUnlockCta ?? false;
+  const displayName = user?.firstName || user?.email || "User";
+  const displayImage = user?.profilePictureUrl;
+
+  // Use real workspaces from query
+  const workspaces = React.useMemo<WorkspaceSwitcherItem[]>(
+    () => (shellState?.switcherItems ?? []) as WorkspaceSwitcherItem[],
+    [shellState?.switcherItems]
+  );
+  const hasMultipleWorkspaces = workspaces.length > 1;
+  const defaultActiveWorkspaceId =
+    workspaces.find((candidate) => candidate.isActive)?.value ?? "";
+  const activeWorkspaceId =
+    preferredShellContext === "workspace" && shellState?.activeWorkspaceId
+      ? shellState.activeWorkspaceId
+      : preferredShellContext === "setup_session" &&
+          shellState?.activeSetupSessionId
+        ? shellState.activeSetupSessionId
+        : defaultActiveWorkspaceId;
+  const [optimisticWorkspaceId, setOptimisticWorkspaceId] =
+    React.useState<string>(activeWorkspaceId);
+  const [isSwitchingWorkspace, setIsSwitchingWorkspace] = React.useState(false);
+  const [shouldAnimateNotificationBadge, setShouldAnimateNotificationBadge] =
+    React.useState(false);
+  const previousPendingCountRef = React.useRef<number | null>(null);
+  const selectedWorkspaceId = isSwitchingWorkspace
+    ? optimisticWorkspaceId
+    : activeWorkspaceId;
+  const workspaceName =
+    workspaces.find((candidate) => candidate.value === selectedWorkspaceId)
+      ?.label ||
+    shellState?.activeSetupSession?.displayName ||
+    workspace?.name ||
+    "No workspace yet";
+  const canCreateWorkspace = workspaceCreationEligibility?.allowed === true;
+  const showUpgradeCta =
+    tier !== "pro" &&
+    (isFree || workspaceCreationEligibility?.allowed === false);
+  const isHeaderLoading =
+    loading ||
+    (!!user &&
+      (planQuery.isPending ||
+        workspaceCreationEligibilityQuery.isPending ||
+        shellStateQuery.isPending));
+  const styleProfileStatus = shellState?.activeWorkspaceStyleProfileStatus;
+  const styleProfilePlatform =
+    shellState?.activeWorkspaceStyleProfilePlatform ?? null;
+  const activeStyleStatus: "collecting" | "analyzing" | null =
+    styleProfileStatus === "collecting" || styleProfileStatus === "analyzing"
+      ? styleProfileStatus
+      : null;
+
+  React.useEffect(() => {
+    const previous = previousPendingCountRef.current;
+    if (previous === null) {
+      previousPendingCountRef.current = pendingNotificationCount;
+      return;
+    }
+
+    const increased = pendingNotificationCount > previous;
+    previousPendingCountRef.current = pendingNotificationCount;
+
+    if (!increased) {
+      return;
+    }
+
+    setShouldAnimateNotificationBadge(true);
+    const timeoutId = window.setTimeout(() => {
+      setShouldAnimateNotificationBadge(false);
+    }, 450);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [pendingNotificationCount]);
+  const activeStyleLabel =
+    activeStyleStatus === null
+      ? null
+      : styleProfilePlatform === "linkedin"
+        ? {
+            collecting: "Reading LinkedIn posts",
+            analyzing: "Learning LinkedIn style",
+          }[activeStyleStatus]
+        : {
+            collecting: "Reading posts",
+            analyzing: "Learning style",
+          }[activeStyleStatus];
+
+  const handleWorkspaceSwitch = React.useCallback(
+    async (workspaceId: string) => {
+      if (
+        !workspaceId ||
+        isSwitchingWorkspace ||
+        workspaceId === selectedWorkspaceId
+      ) {
+        return;
+      }
+
+      const targetItem = workspaces.find(
+        (candidate) => candidate.value === workspaceId
+      );
+      if (!targetItem) {
+        return;
+      }
+
+      if (targetItem.locked) {
+        router.push(getPlansUpgradeHref());
+        return;
+      }
+
+      if (targetItem.kind === "draft" && targetItem.threadId) {
+        setPreferredShellContext("setup_session");
+        router.push(buildSetupHref(targetItem.threadId));
+        return;
+      }
+
+      const targetWorkspaceName = targetItem.label;
+      const previousPreferredShellContext = preferredShellContext;
+
+      setOptimisticWorkspaceId(workspaceId);
+      setIsSwitchingWorkspace(true);
+      startTransition("switching_workspace");
+      setPreferredShellContext("workspace");
+
+      try {
+        await setDefaultWorkspace({
+          workspaceId: targetItem.workspaceId as Id<"workspaces">,
+        });
+        const workspaceSwitchHref = getWorkspaceSwitchHref(pathname);
+        if (workspaceSwitchHref) {
+          router.replace(workspaceSwitchHref);
+        } else {
+          router.refresh();
+        }
+        completeTransition();
+        toast.success("Workspace switched", {
+          description: `Now using ${targetWorkspaceName}.`,
+        });
+      } catch (error) {
+        setOptimisticWorkspaceId(activeWorkspaceId);
+        setPreferredShellContext(previousPreferredShellContext);
+        resetTransition();
+        toast.error("Couldn't switch workspace", {
+          description: "Please try again.",
+        });
+        headerLogger.error("Failed to switch workspace", error);
+      } finally {
+        setIsSwitchingWorkspace(false);
+      }
+    },
+    [
+      activeWorkspaceId,
+      completeTransition,
+      isSwitchingWorkspace,
+      pathname,
+      preferredShellContext,
+      resetTransition,
+      router,
+      selectedWorkspaceId,
+      setDefaultWorkspace,
+      startTransition,
+      workspaces,
+    ]
+  );
+
+  // Tier badge label
+  const tierLabel =
+    tier === "free"
+      ? "Plan required"
+      : tier === "hobby"
+        ? "Hobby"
+        : tier === "base"
+          ? "Base"
+          : "Pro";
+
+  // Theme toggle group
+  const themeToggle = (
+    <ToggleGroup
+      type="single"
+      value={theme === undefined ? "system" : theme}
+      onValueChange={(val) => val && setTheme(val)}
+    >
+      <ToggleGroupItem value="system" size="xsIcon">
+        <ChangeCircleIcon className="fill-current" aria-hidden="true" />
+      </ToggleGroupItem>
+      <ToggleGroupItem value="light" size="xsIcon">
+        <LightModeIcon className="fill-current" aria-hidden="true" />
+      </ToggleGroupItem>
+      <ToggleGroupItem value="dark" size="xsIcon">
+        <DarkModeIcon className="fill-current" aria-hidden="true" />
+      </ToggleGroupItem>
+    </ToggleGroup>
+  );
+
+  const styleStatusBadge = activeStyleStatus ? (
+    <Badge
+      variant="outline"
+      className="inline-flex h-6 items-center gap-1.5 px-2.5 text-[11px]"
+    >
+      {activeStyleStatus === "analyzing" ? (
+        <AsciiSpinnerText
+          text={activeStyleLabel ?? "Learning style"}
+          className="inline-flex items-center gap-1.5"
+        />
+      ) : (
+        <>
+          <AsciiSpinnerText
+            text={
+              styleProfilePlatform === "linkedin"
+                ? "Reading LinkedIn"
+                : "Reading"
+            }
+            className="inline-flex items-center gap-1.5 sm:hidden"
+          />
+          <AsciiSpinnerText
+            text={activeStyleLabel ?? "Reading posts"}
+            className="hidden items-center gap-1.5 sm:inline-flex"
+          />
+        </>
+      )}
+    </Badge>
+  ) : null;
+
+  // Loading state
+  if (isHeaderLoading) {
+    return (
+      <Comp
+        className={cn(headerVariants({ size }), className)}
+        data-rx-chrome-below-banner=""
+        {...props}
+      >
+        <div className="flex items-center">
+          <Link
+            href="/"
+            aria-label="ReacherX Home"
+            className={cn(brandLinkVariants())}
+          >
+            🆁
+          </Link>
+          <span className={cn(versionBadgeFrameVariants())}>
+            <Badge variant="outline-strong">v4 beta</Badge>
+          </span>
+          <SidebarTrigger />
+        </div>
+        <nav className={cn(navVariants())} aria-label="Main navigation">
+          <menu
+            className={cn(desktopNavMenuVariants())}
+            aria-label="Navigation menu"
+          >
+            <li>
+              <Skeleton className="h-6 w-6 rounded-md" aria-hidden="true" />
+            </li>
+            <li>
+              <Skeleton className="h-8 w-8 rounded-full" aria-hidden="true" />
+            </li>
+          </menu>
+        </nav>
+      </Comp>
+    );
+  }
+
+  return (
+    <Comp
+      className={cn(headerVariants({ size }), className)}
+      data-rx-chrome-below-banner=""
+      {...props}
+    >
+      <div className="flex items-center">
+        <Link
+          href="/"
+          aria-label="ReacherX Home"
+          className={cn(brandLinkVariants())}
+        >
+          🆁
+        </Link>
+        <span className={cn(versionBadgeFrameVariants())}>
+          <Badge variant="outline-strong">v4 beta</Badge>
+        </span>
+        <SidebarTrigger />
+      </div>
+
+      <nav className={cn(navVariants())} aria-label="Main navigation">
+        <menu
+          className={cn(desktopNavMenuVariants())}
+          aria-label="Navigation menu"
+        >
+          {styleStatusBadge ? <li>{styleStatusBadge}</li> : null}
+          <WorkspaceUsageIndicator />
+          {workspaceSystemStatus ? (
+            <li>
+              <WorkspaceSystemStatusTrigger status={workspaceSystemStatus} />
+            </li>
+          ) : null}
+          {/* Notification button */}
+          <li>
+            <Button
+              variant="ghost"
+              size="xsIcon"
+              disabled={locked}
+              asChild={!locked}
+              aria-label="Notifications"
+              className="relative"
+            >
+              {locked ? (
+                <>
+                  <NotificationsIcon
+                    className="fill-current"
+                    aria-hidden="true"
+                  />
+                  {pendingNotificationCount > 0 && (
+                    <Badge
+                      variant="secondary"
+                      className={cn(
+                        "border-background absolute -top-2 left-2.5 flex h-5 min-w-5 items-center justify-center border px-1 text-[10px]",
+                        shouldAnimateNotificationBadge &&
+                          "animate-notification-bump"
+                      )}
+                    >
+                      <AnimatedNumber
+                        value={pendingNotificationCount}
+                        suffix={
+                          pendingNotificationCount >= 100 ? "+" : undefined
+                        }
+                        animateOnMount
+                      />
+                    </Badge>
+                  )}
+                </>
+              ) : (
+                <Link href="/notifications">
+                  <NotificationsIcon
+                    className="fill-current"
+                    aria-hidden="true"
+                  />
+                  {pendingNotificationCount > 0 && (
+                    <Badge
+                      variant="secondary"
+                      className={cn(
+                        "border-background absolute -top-2 left-2.5 flex h-5 min-w-5 items-center justify-center border px-1 text-[10px]",
+                        shouldAnimateNotificationBadge &&
+                          "animate-notification-bump"
+                      )}
+                    >
+                      <AnimatedNumber
+                        value={pendingNotificationCount}
+                        suffix={
+                          pendingNotificationCount >= 100 ? "+" : undefined
+                        }
+                        animateOnMount
+                      />
+                    </Badge>
+                  )}
+                </Link>
+              )}
+            </Button>
+          </li>
+          <li>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon" aria-label="User menu">
+                  <Avatar className="size-8">
+                    <AvatarImage src={displayImage || ""} alt={displayName} />
+                    <AvatarFallback>{getInitials(displayName)}</AvatarFallback>
+                  </Avatar>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-56">
+                {/* User name + tier badge */}
+                <DropdownMenuLabel className="flex items-center justify-between">
+                  <span className="truncate">{displayName}</span>
+                  <Badge variant="secondary" className="ml-2 text-[10px]">
+                    {tierLabel}
+                  </Badge>
+                </DropdownMenuLabel>
+
+                {/* Upgrade CTA (free users, or paid users at workspace limit) */}
+                {showUpgradeCta && (
+                  <DropdownMenuItem
+                    disabled={locked}
+                    onSelect={(event) => {
+                      event.preventDefault();
+                      router.push(getPlansUpgradeHref());
+                    }}
+                  >
+                    <UpgradeIcon className="fill-current" aria-hidden="true" />
+                    Upgrade plan
+                  </DropdownMenuItem>
+                )}
+
+                <DropdownMenuSeparator />
+
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel className="text-muted-foreground text-xs font-normal">
+                    People
+                  </DropdownMenuLabel>
+                  <DropdownMenuItem disabled={locked} asChild={!locked}>
+                    {locked ? (
+                      <>
+                        <FramePersonIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        {pageLabels.entities}
+                      </>
+                    ) : (
+                      <Link href="/">
+                        <FramePersonIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        {pageLabels.entities}
+                      </Link>
+                    )}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled={locked} asChild={!locked}>
+                    {locked ? (
+                      <>
+                        <AccountBoxIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        {pageLabels.converts}
+                      </>
+                    ) : (
+                      <Link href={routes.successHref}>
+                        <AccountBoxIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        {pageLabels.converts}
+                      </Link>
+                    )}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled={locked} asChild={!locked}>
+                    {locked ? (
+                      <>
+                        <ArchiveIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        {pageLabels.archives}
+                      </>
+                    ) : (
+                      <Link href="/archives">
+                        <ArchiveIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        {pageLabels.archives}
+                      </Link>
+                    )}
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+
+                <DropdownMenuSeparator />
+
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel className="text-muted-foreground text-xs font-normal">
+                    Agent
+                  </DropdownMenuLabel>
+                  <DropdownMenuItem disabled={locked} asChild={!locked}>
+                    {locked ? (
+                      <>
+                        <ChangeHistoryIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Agent
+                      </>
+                    ) : (
+                      <Link href="/agent">
+                        <ChangeHistoryIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Agent
+                      </Link>
+                    )}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled={locked} asChild={!locked}>
+                    {locked ? (
+                      <>
+                        <ActivityZoneIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Agent observability
+                      </>
+                    ) : (
+                      <Link href="/agent-ops">
+                        <ActivityZoneIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Agent observability
+                      </Link>
+                    )}
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+
+                <DropdownMenuSeparator />
+
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel className="text-muted-foreground text-xs font-normal">
+                    Insights
+                  </DropdownMenuLabel>
+                  <DropdownMenuItem disabled={locked} asChild={!locked}>
+                    {locked ? (
+                      <>
+                        <BidLandscapeIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        {pageLabels.analytics}
+                      </>
+                    ) : (
+                      <Link href="/analytics">
+                        <BidLandscapeIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        {pageLabels.analytics}
+                      </Link>
+                    )}
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+
+                <DropdownMenuSeparator />
+
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel className="text-muted-foreground text-xs font-normal">
+                    Accounts
+                  </DropdownMenuLabel>
+                  <DropdownMenuItem disabled={locked} asChild={!locked}>
+                    {locked ? (
+                      <>
+                        <CreditCardIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Plans
+                      </>
+                    ) : (
+                      <Link href="/plans">
+                        <CreditCardIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Plans
+                      </Link>
+                    )}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled={locked} asChild={!locked}>
+                    {locked ? (
+                      <>
+                        <DataUsageIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Usage
+                      </>
+                    ) : (
+                      <Link href="/usage">
+                        <DataUsageIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Usage
+                      </Link>
+                    )}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled={locked} asChild={!locked}>
+                    {locked ? (
+                      <>
+                        <ManageAccountsIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Connected accounts
+                      </>
+                    ) : (
+                      <Link href="/settings/connected-accounts">
+                        <ManageAccountsIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Connected accounts
+                      </Link>
+                    )}
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+
+                <DropdownMenuSeparator />
+
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel className="text-muted-foreground text-xs font-normal">
+                    Workspace
+                  </DropdownMenuLabel>
+                  <DropdownMenuItem disabled={locked} asChild={!locked}>
+                    {locked ? (
+                      <>
+                        <FolderIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        <span className="truncate">{workspaceName}</span>
+                      </>
+                    ) : (
+                      <Link href="/workspace">
+                        <FolderIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        <span className="truncate">{workspaceName}</span>
+                      </Link>
+                    )}
+                  </DropdownMenuItem>
+
+                  {hasMultipleWorkspaces ? (
+                    <DropdownMenuSub>
+                      <DropdownMenuSubTrigger>
+                        <FolderCopyIcon
+                          className="fill-current"
+                          aria-hidden="true"
+                        />
+                        Workspaces
+                      </DropdownMenuSubTrigger>
+                      <DropdownMenuPortal>
+                        <DropdownMenuSubContent>
+                          {workspaces.map((ws: WorkspaceSwitcherItem) => (
+                            <DropdownMenuItem
+                              key={ws.value}
+                              disabled={ws.locked || isSwitchingWorkspace}
+                              onSelect={(event) => {
+                                event.preventDefault();
+                                if (ws.locked) {
+                                  router.push(getPlansUpgradeHref());
+                                  return;
+                                }
+                                void handleWorkspaceSwitch(ws.value);
+                              }}
+                            >
+                              {ws.locked ? (
+                                <LockIcon
+                                  className="fill-current"
+                                  aria-hidden="true"
+                                />
+                              ) : ws.isActive ? (
+                                <CheckIcon
+                                  className="fill-current"
+                                  aria-hidden="true"
+                                />
+                              ) : (
+                                <span className="size-4 shrink-0" />
+                              )}
+                              <span className="truncate">{ws.label}</span>
+                            </DropdownMenuItem>
+                          ))}
+                          {hasLockedItems ? (
+                            <>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                onSelect={(event) => {
+                                  event.preventDefault();
+                                  router.push(getPlansUpgradeHref());
+                                }}
+                              >
+                                <LockIcon
+                                  className="fill-current"
+                                  aria-hidden="true"
+                                />
+                                {shellState?.unlockCtaLabel ??
+                                  "Unlock workspaces"}
+                              </DropdownMenuItem>
+                            </>
+                          ) : canCreateWorkspace && !isSwitchingWorkspace ? (
+                            <>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                disabled={locked}
+                                onClick={() => void requestNewWorkspace()}
+                              >
+                                <AddIcon
+                                  className="fill-current"
+                                  aria-hidden="true"
+                                />
+                                New workspace
+                              </DropdownMenuItem>
+                            </>
+                          ) : !isHighestTier && !canCreateWorkspace ? (
+                            <>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                disabled={locked}
+                                onSelect={(event) => {
+                                  event.preventDefault();
+                                  if (locked) {
+                                    return;
+                                  }
+                                  router.push(getPlansUpgradeHref());
+                                }}
+                              >
+                                <AddIcon
+                                  className="fill-current"
+                                  aria-hidden="true"
+                                />
+                                New workspace
+                              </DropdownMenuItem>
+                            </>
+                          ) : isHighestTier && !canCreateWorkspace ? (
+                            <>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem disabled>
+                                <AddIcon
+                                  className="fill-current"
+                                  aria-hidden="true"
+                                />
+                                New workspace
+                              </DropdownMenuItem>
+                            </>
+                          ) : null}
+                        </DropdownMenuSubContent>
+                      </DropdownMenuPortal>
+                    </DropdownMenuSub>
+                  ) : hasLockedItems ? (
+                    <DropdownMenuItem
+                      onSelect={(event) => {
+                        event.preventDefault();
+                        router.push(getPlansUpgradeHref());
+                      }}
+                    >
+                      <LockIcon className="fill-current" aria-hidden="true" />
+                      {shellState?.unlockCtaLabel ?? "Unlock workspaces"}
+                    </DropdownMenuItem>
+                  ) : canCreateWorkspace && !isSwitchingWorkspace ? (
+                    <DropdownMenuItem
+                      disabled={locked}
+                      onClick={() => void requestNewWorkspace()}
+                    >
+                      <AddIcon className="fill-current" aria-hidden="true" />
+                      New workspace
+                    </DropdownMenuItem>
+                  ) : !isHighestTier && !canCreateWorkspace ? (
+                    <DropdownMenuItem
+                      disabled={locked}
+                      onSelect={(event) => {
+                        event.preventDefault();
+                        if (locked) {
+                          return;
+                        }
+                        router.push(getPlansUpgradeHref());
+                      }}
+                    >
+                      <AddIcon className="fill-current" aria-hidden="true" />
+                      New workspace
+                    </DropdownMenuItem>
+                  ) : isHighestTier && !canCreateWorkspace ? (
+                    <DropdownMenuItem disabled>
+                      <AddIcon className="fill-current" aria-hidden="true" />
+                      New workspace
+                    </DropdownMenuItem>
+                  ) : null}
+                </DropdownMenuGroup>
+
+                <DropdownMenuSeparator />
+
+                {/* Theme */}
+                <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
+                  <ContrastIcon className="fill-current" aria-hidden="true" />
+                  Theme
+                  <span className="ml-auto">{themeToggle}</span>
+                </DropdownMenuItem>
+
+                {/* Reach out/feedback */}
+                <DropdownMenuItem asChild>
+                  <a href="mailto:creativecoder.crco@gmail.com">
+                    <MailIcon className="fill-current" aria-hidden="true" />
+                    Reach out/feedback
+                  </a>
+                </DropdownMenuItem>
+
+                {/* Home page */}
+                <DropdownMenuItem asChild>
+                  <Link href="/home">
+                    <HomeIcon className="fill-current" aria-hidden="true" />
+                    Home page
+                  </Link>
+                </DropdownMenuItem>
+
+                {/* Log out */}
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void logout();
+                  }}
+                >
+                  <LogoutIcon className="fill-current" aria-hidden="true" />
+                  Log out
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </li>
+        </menu>
+      </nav>
+      {modal}
+    </Comp>
+  );
+}

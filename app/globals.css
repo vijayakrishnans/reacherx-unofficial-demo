@@ -1,0 +1,572 @@
+@import "tailwindcss";
+@import "shadcn/tailwind.css";
+
+@plugin "tailwindcss-animate";
+@plugin "@tailwindcss/typography";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-pixel-square: var(--font-geist-pixel-square);
+
+  --color-main: hsl(var(--main));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --color-platform-twitter-badge: hsl(var(--platform-twitter-badge));
+  --color-platform-twitter-badge-foreground: hsl(
+    var(--platform-twitter-badge-foreground)
+  );
+  --color-platform-linkedin-badge: hsl(var(--platform-linkedin-badge));
+  --color-platform-linkedin-badge-foreground: hsl(
+    var(--platform-linkedin-badge-foreground)
+  );
+
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+
+  --color-sidebar: hsl(var(--sidebar-background));
+  --color-sidebar-foreground: hsl(var(--sidebar-foreground));
+  --color-sidebar-primary: hsl(var(--sidebar-primary));
+  --color-sidebar-primary-foreground: hsl(var(--sidebar-primary-foreground));
+  --color-sidebar-accent: hsl(var(--sidebar-accent));
+  --color-sidebar-accent-foreground: hsl(var(--sidebar-accent-foreground));
+  --color-sidebar-border: hsl(var(--sidebar-border));
+  --color-sidebar-ring: hsl(var(--sidebar-ring));
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+
+  /*
+    Tailwind CSS v4 removed cursor: pointer from buttons by default.
+    Adding it back for v3 parity.
+    See: https://tailwindcss.com/docs/upgrade-guide#preflight-changes
+  */
+  button,
+  [role="button"] {
+    cursor: pointer;
+  }
+  /*
+  ---break---
+*/
+  @keyframes show-top-mask {
+    to {
+      --top-mask-height: var(--mask-height);
+    }
+  }
+  /*
+  ---break---
+*/
+  @keyframes hide-bottom-mask {
+    to {
+      --bottom-mask-height: 0px;
+    }
+  }
+  /*
+  ---break---
+*/
+  @keyframes show-left-mask {
+    to {
+      --left-mask-width: var(--mask-width);
+    }
+  }
+  /*
+  ---break---
+*/
+  @keyframes hide-right-mask {
+    to {
+      --right-mask-width: 0px;
+    }
+  }
+}
+
+@utility text-balance {
+  text-wrap: balance;
+}
+
+@utility animate-pulse-fast {
+  animation: pulse-fast 0.9s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@utility animate-skeleton-shimmer {
+  animation: skeleton-shimmer 2.2s linear infinite;
+}
+
+@utility animate-notification-bump {
+  animation: notification-bump 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes conversation-typing-dot {
+  0%,
+  60%,
+  100% {
+    opacity: 0.38;
+    transform: translate3d(0, 1px, 0) scale(0.88);
+  }
+  30% {
+    opacity: 1;
+    transform: translate3d(0, -2px, 0) scale(1);
+  }
+}
+
+.conversation-typing-dot {
+  animation: conversation-typing-dot 1.08s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  will-change: transform, opacity;
+}
+
+.conversation-typing-dot:nth-child(2) {
+  animation-delay: 120ms;
+}
+
+.conversation-typing-dot:nth-child(3) {
+  animation-delay: 240ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conversation-typing-dot {
+    animation: none;
+    transform: none;
+    opacity: 0.72;
+    will-change: auto;
+  }
+}
+
+.agent-working-mark {
+  color: hsl(var(--foreground));
+}
+
+.agent-working-mark-outline {
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: butt;
+  stroke-linejoin: miter;
+  stroke-width: 4;
+  vector-effect: non-scaling-stroke;
+}
+
+.agent-working-mark-gap {
+  fill: none;
+  stroke: #000;
+  stroke-dasharray: 10.7 122.85;
+  stroke-linecap: butt;
+  stroke-linejoin: miter;
+  stroke-width: 8;
+  transition:
+    stroke-dasharray 520ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 520ms cubic-bezier(0.22, 1, 0.36, 1);
+  vector-effect: non-scaling-stroke;
+  animation: agent-working-mark-gap 0.95s linear infinite;
+}
+
+.agent-working-mark[data-state="ready"] .agent-working-mark-gap {
+  animation-play-state: paused;
+  stroke-dasharray: 0 133.55;
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-working-mark-gap {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+@layer base {
+  :root {
+    /* Set --background to your desired main background color (white) */
+    --background: 0 0% 100%;
+    --foreground: 0 0% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 3.9%;
+    --primary: 0 0% 9%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 0 0% 96.1%;
+    --secondary-foreground: 0 0% 9%;
+    --muted: 0 0% 96.1%;
+    --muted-foreground: 0 0% 45.1%;
+    --accent: 0 0% 96.1%;
+    --accent-foreground: 0 0% 9%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 89.8%;
+    --input: 0 0% 89.8%;
+    --ring: 0 0% 3.9%;
+    --platform-twitter-badge: 82.712 77.974% 55.49%;
+    --platform-twitter-badge-foreground: 0 0% 9%;
+    --platform-linkedin-badge: 172.455 66.008% 50.392%;
+    --platform-linkedin-badge-foreground: 0 0% 9%;
+    --chart-1: 0 0% 9%;
+    --chart-2: 0 0% 35%;
+    --chart-3: 0 0% 55%;
+    --chart-4: 0 0% 75%;
+    --chart-5: 0 0% 90%;
+    --radius: 0.5rem;
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+
+  .dark {
+    /* Set --background to your desired main background color (black) */
+    --background: 0 0% 0%;
+    --foreground: 0 0% 98%;
+    /* Match card and popover backgrounds for consistency */
+    --card: 0 0% 0%;
+    --card-foreground: 0 0% 98%;
+    --popover: 0 0% 0%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 0 0% 98%;
+    --primary-foreground: 0 0% 9%;
+    --secondary: 0 0% 14.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 0 0% 14.9%;
+    --muted-foreground: 0 0% 63.9%;
+    --accent: 0 0% 14.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 14.9%;
+    --input: 0 0% 14.9%;
+    --ring: 0 0% 83.1%;
+    --platform-twitter-badge: 81.972 84.524% 67.059%;
+    --platform-twitter-badge-foreground: 0 0% 9%;
+    --platform-linkedin-badge: 170.571 76.923% 64.314%;
+    --platform-linkedin-badge-foreground: 0 0% 9%;
+    --chart-1: 0 0% 98%;
+    --chart-2: 0 0% 75%;
+    --chart-3: 0 0% 55%;
+    --chart-4: 0 0% 35%;
+    --chart-5: 0 0% 20%;
+    --sidebar-background: 0 0% 0%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 224.3 76.3% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 240 4.8% 95.9%;
+    --sidebar-border: 240 3.7% 15.9%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+body {
+  font-family: var(--font-geist-sans), sans-serif;
+  line-height: 1.2em;
+}
+
+.rx-code-block .shiki,
+.rx-code-block .shiki span {
+  background-color: transparent !important;
+  font-family: var(--font-geist-mono), monospace !important;
+  line-height: 1.429 !important;
+  letter-spacing: -0.04em !important;
+}
+
+html.dark .rx-code-block .shiki,
+html.dark .rx-code-block .shiki span {
+  color: var(--shiki-dark) !important;
+  font-style: var(--shiki-dark-font-style) !important;
+  font-weight: var(--shiki-dark-font-weight) !important;
+  text-decoration: var(--shiki-dark-text-decoration) !important;
+}
+
+html {
+  /* Prevent layout shifts when vertical scrollbars appear/disappear */
+  scrollbar-gutter: stable both-edges;
+  --rx-backend-status-banner-height: 0px;
+}
+
+html[data-backend-status-banner] {
+  --rx-backend-status-banner-height: 2.5rem; /* matches h-10 spacer */
+}
+
+/* Keep fixed/sticky chrome below the site-wide backend status banner */
+html[data-backend-status-banner] [data-rx-chrome-below-banner] {
+  top: var(--rx-backend-status-banner-height);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  letter-spacing: -0.04em;
+}
+
+.font-mono {
+  font-family: var(--font-geist-mono), monospace;
+  line-height: 142.9%; /* You can also use '1.429' for line-height */
+  letter-spacing: -0.04em; /* -4% as 'em' */
+}
+
+@keyframes workspace-usage-fill {
+  from {
+    stroke-dasharray: 0 1;
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .workspace-usage-progress {
+    animation: workspace-usage-fill 600ms ease-out;
+  }
+}
+
+.font-pixel-square {
+  font-family: var(--font-geist-pixel-square), sans-serif;
+}
+
+@utility word-break {
+  word-break: break-word;
+}
+
+.rotating-symbol {
+  display: inline-block; /* Keeps it in line with the text */
+  animation: rotate 12s steps(12) infinite; /* Rotates in 12 steps over 12 seconds */
+}
+
+@keyframes rotate {
+  from {
+    transform: rotate(0deg); /* Starting point */
+  }
+  to {
+    transform: rotate(360deg); /* Full rotation */
+  }
+}
+
+@keyframes notification-bump {
+  0% {
+    transform: scale(1);
+  }
+  35% {
+    transform: scale(1.14);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes pulse-fast {
+  50% {
+    opacity: 0.6;
+  }
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+@keyframes agent-working-mark-gap {
+  to {
+    stroke-dashoffset: -133.55;
+  }
+}
+
+/*
+ * Radix ScrollArea wraps viewport children in a div with inline styles
+ * `display:table; min-width:100%`. display:table sizes to intrinsic content
+ * width — it ignores max-width and overflows the viewport — so flex ancestors
+ * see an unbounded width and min-w-0/truncate never take effect.
+ * Override both inline styles globally so all ScrollArea viewports constrain
+ * their children to the real available width.
+ */
+[data-radix-scroll-area-viewport] > div {
+  display: block !important;
+  min-width: 0 !important;
+}
+
+/*
+ * Radix + react-remove-scroll can leave the page in an overly locked state
+ * around dialog/open-menu transitions. Keep the scrollbar compensation neutral
+ * and restore pointer interaction while the overlay itself continues to block
+ * the background.
+ */
+body[data-scroll-locked] {
+  margin-right: 0 !important;
+  pointer-events: auto !important;
+}
+
+/* Scoped fix: neutralize Radix ScrollArea internal wrapper on /prospects */
+.prospect-profile-scrollarea [style*="display: table"] {
+  display: unset !important;
+}
+.prospect-profile-scrollarea [style*="min-width: 100%"] {
+  min-width: auto !important;
+}
+
+/* ResponseStream fade animation - CSS extracted to avoid per-render injection */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.fade-segment {
+  display: inline-block;
+  opacity: 0;
+  animation: fadeIn var(--fade-duration, 200ms) ease-out forwards;
+}
+
+.fade-segment-space {
+  white-space: pre;
+}
+
+@property --top-mask-height {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
+@property --bottom-mask-height {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 64px;
+}
+
+@property --left-mask-width {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
+@property --right-mask-width {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 64px;
+}
+
+/*
+  ---break---
+*/
+
+@utility card-fade-bottom {
+  mask-image: linear-gradient(
+    to bottom,
+    black 0%,
+    black 50%,
+    rgba(0, 0, 0, 0.92) 64%,
+    rgba(0, 0, 0, 0.72) 76%,
+    rgba(0, 0, 0, 0.42) 88%,
+    transparent 100%
+  );
+  mask-repeat: no-repeat;
+  mask-size: 100% 100%;
+}
+
+@utility card-fade-bottom-mid {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    black 0%,
+    rgba(0, 0, 0, 0.92) 10%,
+    rgba(0, 0, 0, 0.72) 28%,
+    rgba(0, 0, 0, 0.42) 52%,
+    rgba(0, 0, 0, 0.14) 76%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    black 0%,
+    rgba(0, 0, 0, 0.92) 10%,
+    rgba(0, 0, 0, 0.72) 28%,
+    rgba(0, 0, 0, 0.42) 52%,
+    rgba(0, 0, 0, 0.14) 76%,
+    transparent 100%
+  );
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: 100% 100%;
+  mask-size: 100% 100%;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 200% center;
+  }
+  to {
+    background-position: -200% center;
+  }
+}
+
+/*
+  Marketing nav full-bleed panels: Radix NavigationMenu hard-codes
+  `position: relative` on its Root and List wrapper. Neutralize both so
+  NavigationMenu.Content anchors to the sticky header and can span the
+  viewport width edge to edge (Vercel-style dropdown).
+*/
+[data-rx-marketing-nav],
+[data-rx-marketing-nav] > div {
+  position: static !important;
+}
